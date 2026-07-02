@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::frame::{read_worker_frame, write_worker_frame};
 use crate::types::*;
@@ -251,7 +251,7 @@ impl AssetStudioWorkerPool {
                 recycled_workers = recycled,
                 "recycling assetstudio ffi worker after configured call limit"
             );
-            worker.kill();
+            worker.kill().await;
             return;
         }
         self.available.lock().await.push(worker);
@@ -288,9 +288,9 @@ impl WorkerLease {
         stats
     }
 
-    pub fn kill(mut self) {
+    pub async fn kill(mut self) {
         if let Some(mut worker) = self.worker.take() {
-            worker.kill();
+            worker.kill().await;
         }
     }
 }
@@ -424,7 +424,7 @@ impl PooledWorker {
         }
     }
 
-    fn kill(&mut self) {
+    async fn kill(&mut self) {
         let killed = self.stats.killed.fetch_add(1, Ordering::Relaxed) + 1;
         debug!(
             worker_id = self.worker_id,
@@ -432,7 +432,37 @@ impl PooledWorker {
             killed_workers = killed,
             "killing assetstudio ffi worker"
         );
-        let _ = self.child.start_kill();
+        if let Err(source) = self.child.start_kill() {
+            debug!(
+                worker_id = self.worker_id,
+                error = %source,
+                "assetstudio ffi worker kill signal failed"
+            );
+            return;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(status)) => {
+                debug!(
+                    worker_id = self.worker_id,
+                    status = %status,
+                    "assetstudio ffi worker exited after kill"
+                );
+            }
+            Ok(Err(source)) => {
+                warn!(
+                    worker_id = self.worker_id,
+                    error = %source,
+                    "failed to wait for killed assetstudio ffi worker"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    worker_id = self.worker_id,
+                    "timed out waiting for killed assetstudio ffi worker to exit"
+                );
+            }
+        }
     }
 }
 

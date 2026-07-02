@@ -254,7 +254,7 @@ pub(super) async fn call_assetstudio_ffi_object_export_pooled(
             Ok(summary)
         }
         Err(error) => {
-            lease.kill();
+            lease.kill().await;
             drop(cpu_budget_slot.permit);
             Err(error)
         }
