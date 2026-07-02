@@ -91,6 +91,8 @@ mod tests {
             RegionConfig {
                 enabled: true,
                 provider: RegionProviderConfig::ColorfulPalette {
+                    current_version_url: None,
+                    game_version_url_template: None,
                     asset_info_url_template:
                         "https://info/{env}/{hash}/{asset_version}/{asset_hash}".to_string(),
                     asset_bundle_url_template: "https://bundle/{bundle_path}".to_string(),

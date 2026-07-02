@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -42,6 +41,7 @@ use crate::core::media::{
     convert_usm_to_mp4_with_backend, convert_wav_bytes_to_flac_with_backend,
     convert_wav_bytes_to_mp3_with_backend, FrameRate,
 };
+use crate::core::regions::{compile_patterns, matches_any};
 use crate::core::storage::{upload_to_all_storages, StorageUploadOptions};
 
 mod assetstudio;

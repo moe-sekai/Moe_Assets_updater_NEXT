@@ -1,3 +1,16 @@
+//! Legacy per-bundle download record.
+//!
+//! Historically this was the client's dedup memory: a `bundle_path ->
+//! bundle_hash` map persisted next to the extracted assets so the next run
+//! could skip bundles it had already downloaded. The HIP/1 poller replaces
+//! this entirely — dedup is now server-authoritative via `CHECK_BATCH`, and
+//! Layer 1 uses `bundle_diff` msgpack snapshots instead of this JSON map.
+//!
+//! The module is kept alive only because `AssetExecutionContext::execute`
+//! (still the workhorse for one region's actual download/decrypt/export
+//! pass) reads and writes the record inline. It is essentially a scratch
+//! file at this point; the poller does not consult it for scheduling.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

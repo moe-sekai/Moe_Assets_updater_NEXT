@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub concurrency: ConcurrencyConfig,
     pub storage: StorageConfig,
     pub git_sync: GitSyncConfig,
+    pub poller: PollerConfig,
+    pub hip: HipConfig,
     pub regions: BTreeMap<String, RegionConfig>,
 }
 
@@ -50,9 +52,74 @@ impl Default for AppConfig {
             concurrency: ConcurrencyConfig::default(),
             storage: StorageConfig::default(),
             git_sync: GitSyncConfig::default(),
+            poller: PollerConfig::default(),
+            hip: HipConfig::default(),
             regions: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PollerConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub watermark_file: String,
+    pub last_info_dir: String,
+    pub max_concurrent_regions: usize,
+}
+
+impl Default for PollerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 60,
+            watermark_file: "./Data/poller/watermarks.json".to_string(),
+            last_info_dir: "./Data/poller/last_info".to_string(),
+            max_concurrent_regions: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HipConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub bearer_token: Option<String>,
+    pub tls: HipTlsConfig,
+    pub handshake_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_frame_bytes: u64,
+    pub chunk_size_bytes: usize,
+    pub max_in_flight_uploads: u32,
+    pub check_batch_size: usize,
+    pub heartbeat_interval_seconds: u64,
+}
+
+impl Default for HipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "127.0.0.1:7420".to_string(),
+            bearer_token: None,
+            tls: HipTlsConfig::default(),
+            handshake_timeout_ms: 5_000,
+            request_timeout_ms: 30_000,
+            max_frame_bytes: 16 * 1024 * 1024,
+            chunk_size_bytes: 1024 * 1024,
+            max_in_flight_uploads: 8,
+            check_batch_size: 512,
+            heartbeat_interval_seconds: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HipTlsConfig {
+    pub enabled: bool,
+    pub ca_file: Option<String>,
 }
 
 impl AppConfig {
@@ -1609,6 +1676,10 @@ pub struct RegionConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegionProviderConfig {
     ColorfulPalette {
+        #[serde(default)]
+        current_version_url: Option<String>,
+        #[serde(default)]
+        game_version_url_template: Option<String>,
         asset_info_url_template: String,
         asset_bundle_url_template: String,
         profile: String,
@@ -1619,6 +1690,8 @@ pub enum RegionProviderConfig {
         cookie_bootstrap_url: Option<String>,
     },
     Nuverse {
+        #[serde(default)]
+        current_version_url: Option<String>,
         asset_version_url: String,
         app_version: String,
         asset_info_url_template: String,
@@ -1633,6 +1706,8 @@ pub enum RegionProviderConfig {
 impl Default for RegionProviderConfig {
     fn default() -> Self {
         Self::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
             asset_info_url_template: String::new(),
             asset_bundle_url_template: String::new(),
             profile: String::new(),
@@ -1703,6 +1778,7 @@ pub struct RegionExportConfig {
     #[serde(default = "default_asset_studio_export_types")]
     pub asset_studio_types: Vec<String>,
     pub raw_bundles: Option<RawBundleExportConfig>,
+    pub mesh: MeshExportConfig,
     pub haruki_3d: Haruki3dExportConfig,
     pub usm: UsmExportConfig,
     pub acb: AcbExportConfig,
@@ -1718,6 +1794,7 @@ impl Default for RegionExportConfig {
             by_category: false,
             asset_studio_types: default_asset_studio_export_types(),
             raw_bundles: None,
+            mesh: MeshExportConfig::default(),
             haruki_3d: Haruki3dExportConfig::default(),
             usm: UsmExportConfig::default(),
             acb: AcbExportConfig::default(),
@@ -1735,6 +1812,13 @@ pub struct RawBundleExportConfig {
     pub output_dir: Option<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MeshExportConfig {
+    pub export_obj: bool,
+    pub path_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2360,6 +2444,10 @@ haruki_3d:
 
     #[test]
     fn example_config_advertises_current_haruki_3d_pipeline_selectors() {
+        let _guard = env_lock();
+        // The example config uses ${env:HARUKI_HIP_TOKEN} to demonstrate
+        // secret injection; supply a stub so config loading succeeds.
+        std::env::set_var("HARUKI_HIP_TOKEN", "test-hip-token");
         let config_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("haruki-asset-configs.example.yaml");
         let config = AppConfig::load_from_path(config_path).unwrap();

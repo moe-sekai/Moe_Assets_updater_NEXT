@@ -1,4 +1,5 @@
 pub mod asset_execution;
+pub mod bundle_diff;
 pub mod cleanup;
 pub mod codec;
 pub mod config;
@@ -6,6 +7,7 @@ pub mod download_records;
 pub mod errors;
 pub mod export_pipeline;
 pub mod git_sync;
+pub mod hip;
 pub mod media;
 pub mod models;
 pub mod pipeline;

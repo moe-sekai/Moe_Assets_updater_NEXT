@@ -67,6 +67,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
+    curl \
     libxml2 \
     libavcodec61 \
     libavformat61 \

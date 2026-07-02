@@ -4,7 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Haruki Sekai Asset Updater is a Rust HTTP service that extracts and exports game assets from Project Sekai. It downloads asset bundles, deobfuscates them (AES-CBC), runs codec/export pipelines, uploads results to S3-compatible storage, and optionally syncs chart hashes via git. This is **not** a Go project -- the Go edition was removed.
+Haruki Sekai Asset Updater is a Rust long-running poller that extracts and
+exports game assets from Project Sekai. Every `poller.interval_seconds` it
+checks each region's `current_version.json` on the Team-Haruki mirror; on
+version change it downloads asset bundles, decrypts them (AES-CBC), runs
+codec/export pipelines, and ships the resulting artefacts to the pjsk.moe
+dedup gateway over the HIP/1 binary protocol (`docs/hip.md`). A minimal
+Axum sidecar exposes `/healthz` and `/trigger/{region}` for probes and
+manual re-runs. This is **not** a Go project -- the Go edition was
+removed.
 
 ## Build & Development Commands
 
@@ -47,21 +55,32 @@ docker compose up --build
   - `export_pipeline` module -- AssetStudio FFI export, PNG/WebP encoding, media conversion
   - `codec.rs` -- wraps the `cridecoder` crate for USM/ACB decoding
   - `media.rs` -- ffmpeg-based conversions (USM/M2V to MP4, WAV to FLAC/MP3)
-  - `storage.rs` -- S3-compatible upload via OpenDAL
+  - `storage.rs` -- legacy S3-compatible upload via OpenDAL (kept as a
+    non-default fallback; HIP is the primary upload path)
   - `git_sync.rs` -- chart hash sync via Git CLI
   - `regions.rs` -- multi-region (JP/EN/TW/KR/CN) config selection
   - `retry.rs` -- generic async retry helper
-  - `download_records.rs` -- tracks previously downloaded assets
+  - `bundle_diff.rs` -- Layer-1 diff of AssetBundleInfo snapshots (msgpack + zstd)
+  - `hip/` -- HIP/1 binary protocol client (frame, codec, session, TLS)
   - `models.rs` / `errors.rs` -- shared types and error enums
 
-- `src/service.rs` / `src/service/` -- HTTP and infrastructure:
-  - `http` -- Axum router, handlers, `AppState`
-  - `jobs.rs` -- async job manager with progress tracking and cancellation
+- `src/service.rs` / `src/service/` -- runtime services:
+  - `poller.rs` -- per-region tick loop with Layer 0 (watermark) / Layer 1
+    (local diff) / Layer 2 (HIP CHECK) three-stage pruning; drives one
+    HIP session per region per version change
+  - `watermark.rs` -- persisted "last successfully committed version" per region
+  - `http.rs` -- minimal Axum sidecar: `/healthz` and `/trigger/{region}`
   - `logging.rs` -- tracing-subscriber setup with file and JSON output
 
 - `crates/assetstudio-ffi/` -- AssetStudio FFI ABI and `assetstudio_ffi_worker`
 
-**Request flow:** `POST /v2/assets/update` -> handler creates a job -> `JobManager` spawns a tokio task -> `build_execution_plan` -> `AssetExecutionContext` runs download/decrypt/export/upload pipeline -> job status queryable via `GET /v2/jobs/{id}`.
+**Request flow:** poller tick -> fetch `current_version.json` -> compare
+against watermark (Layer 0) -> fetch new AssetBundleInfo -> diff against
+last snapshot (Layer 1) -> open HIP session -> `CHECK_BATCH` on the
+diff-changed set (Layer 2) -> download+decrypt+export the surviving
+bundles -> stream artefacts as `UPLOAD_BEGIN/CHUNK/END` (sha256 verified
+server-side) -> `COMMIT`. On success, persist the new watermark and a
+snapshot containing only processed bundles.
 
 ## Key Constraints
 
@@ -78,10 +97,19 @@ docker compose up --build
 
 ## HTTP Endpoints
 
-- `GET /healthz`
-- `POST /v2/assets/update`
-- `GET /v2/jobs/{id}`
-- `POST /v2/jobs/{id}/cancel`
+Sidecar only. Job submission and v2 job APIs were removed.
+
+- `GET /healthz` -- liveness and per-region poller state
+- `POST /trigger/{region}` -- force the poller to run one region immediately
+  (auth required when `server.auth.enabled=true`)
+
+## HIP/1 Protocol
+
+Binary length-prefixed protocol used by the poller to submit dedup-aware
+bundles to the pjsk.moe gateway. See `docs/hip.md` for the full spec.
+
+Client implementation: `src/core/hip/{frame,codec,client,errors}.rs`. A
+loopback mock server for integration testing lives in `tests/hip_mock.rs`.
 
 ## Environment Variables
 
@@ -91,6 +119,8 @@ docker compose up --build
 - `HARUKI_MEDIA_BACKEND` -- media backend selection (`ffi`, `auto`, or `cli`)
 - `HARUKI_SHARED_AES_KEY_HEX` / `HARUKI_SHARED_AES_IV_HEX` -- shared AES keys (JP/TW/KR/CN)
 - `HARUKI_EN_AES_KEY_HEX` / `HARUKI_EN_AES_IV_HEX` -- EN-specific AES keys
+- `HARUKI_HIP_TOKEN` -- bearer token sent in `HELLO` to the HIP gateway
+- `HARUKI_TRIGGER_TOKEN` -- bearer token required by `POST /trigger/{region}`
 - `RUST_LOG` -- tracing log level filter
 
 ## Git commits

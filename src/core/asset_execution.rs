@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 use chrono::FixedOffset;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, COOKIE, SET_COOKIE,
-    USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE,
+    SET_COOKIE, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -110,14 +110,117 @@ pub struct AssetBundleInfo {
     pub bundles: HashMap<String, AssetBundleDetail>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurrentVersionInfo {
+    #[serde(rename = "appVersion")]
+    pub app_version: Option<String>,
+    #[serde(rename = "appHash")]
+    pub app_hash: Option<String>,
+    #[serde(rename = "assetVersion")]
+    pub asset_version: Option<String>,
+    #[serde(rename = "assetHash")]
+    pub asset_hash: Option<String>,
+}
+
+impl CurrentVersionInfo {
+    pub fn app_version_or_default(&self) -> String {
+        self.app_version.clone().unwrap_or_default()
+    }
+    pub fn app_hash_or_default(&self) -> String {
+        self.app_hash.clone().unwrap_or_default()
+    }
+    pub fn asset_version_or_default(&self) -> String {
+        self.asset_version.clone().unwrap_or_default()
+    }
+    pub fn asset_hash_or_default(&self) -> String {
+        self.asset_hash.clone().unwrap_or_default()
+    }
+}
+
+/// Fetch and deserialize `current_version_url` for a region, without
+/// running the full asset execution pipeline. Used by the poller for
+/// Layer-0 watermark comparison.
+pub async fn fetch_current_version_info(
+    client: &reqwest::Client,
+    region: &RegionConfig,
+    region_name: &str,
+) -> Result<CurrentVersionInfo, AssetExecutionError> {
+    let url = match &region.provider {
+        RegionProviderConfig::ColorfulPalette {
+            current_version_url,
+            ..
+        }
+        | RegionProviderConfig::Nuverse {
+            current_version_url,
+            ..
+        } => current_version_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AssetExecutionError::MissingAssetVersionOrHash {
+                region: region_name.to_string(),
+            })?
+            .to_string(),
+    };
+    let response = client.get(&url).send().await?;
+    if !response.status().is_success() {
+        return Err(AssetExecutionError::HttpStatus {
+            url,
+            status: response.status().as_u16(),
+        });
+    }
+    let bytes = response.bytes().await?;
+    sonic_rs::from_slice::<CurrentVersionInfo>(&bytes)
+        .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GameVersionInfo {
+    profile: Option<String>,
+    #[serde(rename = "assetbundleHostHash")]
+    assetbundle_host_hash: Option<String>,
+    domain: Option<String>,
+}
+
 #[derive(Debug, Clone)]
-struct DownloadTask {
-    download_path: String,
-    bundle_path: String,
-    bundle_hash: String,
-    category: AssetCategory,
-    file_size: i64,
-    priority: usize,
+pub struct DownloadTask {
+    pub download_path: String,
+    pub bundle_path: String,
+    pub bundle_hash: String,
+    pub category: AssetCategory,
+    pub file_size: i64,
+    pub priority: usize,
+}
+
+/// Async filter applied between task planning and actual downloads.
+///
+/// Used by the poller to run HIP `CHECK_BATCH` against the gateway and drop
+/// tasks whose bundle_hash the server has already seen.
+pub trait PreDownloadTaskFilter: Send {
+    fn filter(
+        self,
+        tasks: Vec<DownloadTask>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<DownloadTask>, AssetExecutionError>> + Send,
+        >,
+    >;
+}
+
+/// Placeholder that never removes tasks; used when no filter is configured.
+pub struct NoopTaskFilter;
+
+impl PreDownloadTaskFilter for NoopTaskFilter {
+    fn filter(
+        self,
+        tasks: Vec<DownloadTask>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<DownloadTask>, AssetExecutionError>> + Send,
+        >,
+    > {
+        Box::pin(async move { Ok(tasks) })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +228,14 @@ pub struct AssetExecutionContext {
     client: reqwest::Client,
     region_name: String,
     region: RegionConfig,
-    request: AssetUpdateRequest,
     retry: crate::core::config::RetryConfig,
     runtime_cookie: Option<String>,
+    resolved_app_version: Option<String>,
+    resolved_app_hash: Option<String>,
     resolved_asset_version: Option<String>,
+    resolved_asset_hash: Option<String>,
+    resolved_profile: Option<String>,
+    resolved_assetbundle_host_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,6 +279,12 @@ pub enum ExecutionProgressUpdate {
     BundleExported {
         bundle: String,
         elapsed_ms: u128,
+    },
+    BundleArtefactsProduced {
+        bundle: String,
+        bundle_hash: String,
+        export_root: std::path::PathBuf,
+        files: Vec<std::path::PathBuf>,
     },
     BundleFfiExportPhases {
         bundle: String,
@@ -272,19 +385,37 @@ impl AssetExecutionContext {
                 .map_err(|err| AssetExecutionError::HttpClient(err.to_string()))?,
             region_name: region_name.to_string(),
             region: region.clone(),
-            request: request.clone(),
             retry: app_config.execution.retry.clone(),
             runtime_cookie: None,
+            resolved_app_version: None,
+            resolved_app_hash: None,
             resolved_asset_version: request.asset_version.clone(),
+            resolved_asset_hash: request.asset_hash.clone(),
+            resolved_profile: None,
+            resolved_assetbundle_host_hash: None,
         })
     }
 
     pub async fn execute(
-        mut self,
+        self,
         app_config: &AppConfig,
         progress: Option<UnboundedSender<ExecutionProgressUpdate>>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<ExecutionSummary, AssetExecutionError> {
+        self.execute_with_filter(app_config, progress, cancel_flag, None::<NoopTaskFilter>)
+            .await
+    }
+
+    pub async fn execute_with_filter<F>(
+        mut self,
+        app_config: &AppConfig,
+        progress: Option<UnboundedSender<ExecutionProgressUpdate>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        pre_download_filter: Option<F>,
+    ) -> Result<ExecutionSummary, AssetExecutionError>
+    where
+        F: PreDownloadTaskFilter,
+    {
         self.ensure_not_cancelled(&cancel_flag)?;
         let record_path = self
             .region
@@ -317,7 +448,17 @@ impl AssetExecutionContext {
                 message: "building download task list".to_string(),
             },
         );
-        let tasks = self.build_download_tasks(&info, &downloaded_assets);
+        let mut tasks = self.build_download_tasks(&info, &downloaded_assets);
+        if let Some(filter) = pre_download_filter {
+            let before = tasks.len();
+            tasks = filter.filter(tasks).await?;
+            tracing::info!(
+                region = %self.region_name,
+                before,
+                after = tasks.len(),
+                "pre-download filter applied"
+            );
+        }
         Self::send_progress(
             &progress,
             ExecutionProgressUpdate::DownloadsPlanned { total: tasks.len() },
@@ -966,6 +1107,15 @@ impl AssetExecutionContext {
         }
         Self::send_progress(
             progress,
+            ExecutionProgressUpdate::BundleArtefactsProduced {
+                bundle: job.bundle_path.clone(),
+                bundle_hash: job.bundle_hash.clone(),
+                export_root: post_process_summary.export_root.clone(),
+                files: post_process_summary.generated_files.clone(),
+            },
+        );
+        Self::send_progress(
+            progress,
             ExecutionProgressUpdate::BundleExported {
                 bundle: job.bundle_path,
                 elapsed_ms: job.export_started.elapsed().as_millis(),
@@ -1032,7 +1182,145 @@ impl AssetExecutionContext {
     async fn fetch_asset_bundle_info(&mut self) -> Result<AssetBundleInfo, AssetExecutionError> {
         let url = self.render_asset_info_url().await?;
         let body = self.get_with_retry(&url).await?;
-        decrypt_asset_bundle_info(
+        self.decrypt_region_msgpack(&body)
+    }
+
+    async fn resolve_provider_versions(&mut self) -> Result<(), AssetExecutionError> {
+        let provider = self.region.provider.clone();
+        match provider {
+            RegionProviderConfig::ColorfulPalette {
+                current_version_url,
+                game_version_url_template,
+                profile,
+                profile_hashes,
+                ..
+            } => {
+                let current = if let Some(url) = current_version_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let body = self.get_with_retry(url).await?;
+                    let current = sonic_rs::from_slice::<CurrentVersionInfo>(&body)
+                        .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))?;
+                    self.resolved_app_version = current.app_version.clone();
+                    self.resolved_app_hash = current.app_hash.clone();
+                    self.resolved_asset_version = current.asset_version.clone();
+                    self.resolved_asset_hash = current.asset_hash.clone();
+                    Some(current)
+                } else {
+                    None
+                };
+
+                let app_version = self.resolved_app_version.as_deref().or(current
+                    .as_ref()
+                    .and_then(|value| value.app_version.as_deref()));
+                let app_hash = self
+                    .resolved_app_hash
+                    .as_deref()
+                    .or(current.as_ref().and_then(|value| value.app_hash.as_deref()));
+
+                if let (Some(template), Some(app_version), Some(app_hash)) = (
+                    game_version_url_template
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    app_version,
+                    app_hash,
+                ) {
+                    let url = template
+                        .replace("{app_version}", app_version)
+                        .replace("{app_hash}", app_hash);
+                    let game_version = self.fetch_game_version(&url, app_version, app_hash).await?;
+                    self.resolved_profile = game_version.profile.or_else(|| Some(profile.clone()));
+                    self.resolved_assetbundle_host_hash = game_version.assetbundle_host_hash;
+                    if let Some(domain) = game_version.domain {
+                        tracing::debug!(region = %self.region_name, domain, "resolved game API domain");
+                    }
+                } else {
+                    self.resolved_profile = Some(profile.clone());
+                    if let Some(profile_hash) = profile_hashes.get(&profile) {
+                        self.resolved_assetbundle_host_hash = Some(profile_hash.clone());
+                    }
+                }
+                Ok(())
+            }
+            RegionProviderConfig::Nuverse {
+                current_version_url,
+                app_version,
+                ..
+            } => {
+                self.resolved_app_version = Some(app_version);
+                if let Some(url) = current_version_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let body = self.get_with_retry(url).await?;
+                    let current = sonic_rs::from_slice::<CurrentVersionInfo>(&body)
+                        .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))?;
+                    if let Some(app_version) = current.app_version {
+                        self.resolved_app_version = Some(app_version);
+                    }
+                    self.resolved_app_hash = current.app_hash;
+                    self.resolved_asset_hash = current.asset_hash;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn fetch_game_version(
+        &self,
+        url: &str,
+        app_version: &str,
+        app_hash: &str,
+    ) -> Result<GameVersionInfo, AssetExecutionError> {
+        let body = retry_async(
+            &self.retry,
+            "game version",
+            |_| async {
+                let mut request = self
+                    .client
+                    .get(url)
+                    .header(ACCEPT, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(ACCEPT_ENCODING, "identity")
+                    .header(
+                        USER_AGENT,
+                        format!("UnityPlayer/{}", self.region.runtime.unity_version),
+                    )
+                    .header("X-Platform", "iOS")
+                    .header("X-DeviceModel", "HarukiAssetUpdater/1.0")
+                    .header("X-OperatingSystem", "iOS")
+                    .header("X-Unity-Version", &self.region.runtime.unity_version)
+                    .header("X-App-Version", app_version)
+                    .header("X-App-Hash", app_hash);
+                if let Some(cookie) = &self.runtime_cookie {
+                    request = request.header(COOKIE, cookie);
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        Ok(response.bytes().await?.to_vec())
+                    }
+                    Ok(response) => Err(AssetExecutionError::HttpStatus {
+                        url: url.to_string(),
+                        status: response.status().as_u16(),
+                    }),
+                    Err(err) => Err(AssetExecutionError::Http(err)),
+                }
+            },
+            is_retryable_http_error,
+        )
+        .await?;
+        self.decrypt_region_msgpack(&body)
+    }
+
+    fn decrypt_region_msgpack<T>(&self, body: &[u8]) -> Result<T, AssetExecutionError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        decrypt_region_msgpack(
             self.region.crypto.aes_key_hex.as_deref().ok_or_else(|| {
                 AssetExecutionError::MissingCryptoConfig {
                     region: self.region_name.clone(),
@@ -1043,7 +1331,7 @@ impl AssetExecutionContext {
                     region: self.region_name.clone(),
                 }
             })?,
-            &body,
+            body,
         )
     }
 
@@ -1055,22 +1343,25 @@ impl AssetExecutionContext {
                 profile_hashes,
                 ..
             } => {
-                let asset_version = self.request.asset_version.as_deref().ok_or_else(|| {
+                let asset_version = self.resolved_asset_version.as_deref().ok_or_else(|| {
                     AssetExecutionError::MissingAssetVersionOrHash {
                         region: self.region_name.clone(),
                     }
                 })?;
-                let asset_hash = self.request.asset_hash.as_deref().ok_or_else(|| {
+                let asset_hash = self.resolved_asset_hash.as_deref().ok_or_else(|| {
                     AssetExecutionError::MissingAssetVersionOrHash {
                         region: self.region_name.clone(),
                     }
                 })?;
-                let profile_hash = profile_hashes.get(profile).ok_or_else(|| {
-                    AssetExecutionError::MissingProfileHash {
+                let profile = self.resolved_profile.as_deref().unwrap_or(profile);
+                let profile_hash = self
+                    .resolved_assetbundle_host_hash
+                    .as_deref()
+                    .or_else(|| profile_hashes.get(profile).map(String::as_str))
+                    .ok_or_else(|| AssetExecutionError::MissingProfileHash {
                         region: self.region_name.clone(),
-                        profile: profile.clone(),
-                    }
-                })?;
+                        profile: profile.to_string(),
+                    })?;
                 Ok(asset_info_url_template
                     .replace("{env}", profile)
                     .replace("{hash}", profile_hash)
@@ -1084,9 +1375,8 @@ impl AssetExecutionContext {
                 asset_info_url_template,
                 ..
             } => {
-                // For nuverse, always fetch the version from asset_version_url.
-                // The incoming request.asset_version is intentionally ignored here
-                // to match Go reference behavior.
+                // For nuverse, always fetch the CDN asset version from asset_version_url.
+                let app_version = self.resolved_app_version.as_deref().unwrap_or(app_version);
                 let version_url = asset_version_url.replace("{app_version}", app_version);
                 let resolved_version =
                     String::from_utf8_lossy(&self.get_with_retry(&version_url).await?)
@@ -1109,22 +1399,25 @@ impl AssetExecutionContext {
                 profile_hashes,
                 ..
             } => {
-                let asset_version = self.request.asset_version.as_deref().ok_or_else(|| {
+                let asset_version = self.resolved_asset_version.as_deref().ok_or_else(|| {
                     AssetExecutionError::MissingAssetVersionOrHash {
                         region: self.region_name.clone(),
                     }
                 })?;
-                let asset_hash = self.request.asset_hash.as_deref().ok_or_else(|| {
+                let asset_hash = self.resolved_asset_hash.as_deref().ok_or_else(|| {
                     AssetExecutionError::MissingAssetVersionOrHash {
                         region: self.region_name.clone(),
                     }
                 })?;
-                let profile_hash = profile_hashes.get(profile).ok_or_else(|| {
-                    AssetExecutionError::MissingProfileHash {
+                let profile = self.resolved_profile.as_deref().unwrap_or(profile);
+                let profile_hash = self
+                    .resolved_assetbundle_host_hash
+                    .as_deref()
+                    .or_else(|| profile_hashes.get(profile).map(String::as_str))
+                    .ok_or_else(|| AssetExecutionError::MissingProfileHash {
                         region: self.region_name.clone(),
-                        profile: profile.clone(),
-                    }
-                })?;
+                        profile: profile.to_string(),
+                    })?;
 
                 Ok(asset_bundle_url_template
                     .replace("{bundle_path}", &task.download_path)
@@ -1139,6 +1432,7 @@ impl AssetExecutionContext {
                 app_version,
                 ..
             } => {
+                let app_version = self.resolved_app_version.as_deref().unwrap_or(app_version);
                 let asset_version = self
                     .resolved_asset_version
                     .as_deref()
@@ -1534,6 +1828,10 @@ impl AssetExecutionContext {
         if self.requires_cookies() {
             self.fetch_runtime_cookies().await?;
         }
+
+        self.resolve_provider_versions().await?;
+
+        self.ensure_not_cancelled(&cancel_flag)?;
         let info = self.fetch_asset_bundle_info().await?;
         let record_path = self
             .region
@@ -1821,6 +2119,7 @@ pub async fn fetch_live_asset_bundle_info(
     if context.requires_cookies() {
         context.fetch_runtime_cookies().await?;
     }
+    context.resolve_provider_versions().await?;
     context.fetch_asset_bundle_info().await
 }
 
@@ -1848,6 +2147,17 @@ pub fn decrypt_asset_bundle_info(
     aes_iv_hex: &str,
     content: &[u8],
 ) -> Result<AssetBundleInfo, AssetExecutionError> {
+    decrypt_region_msgpack(aes_key_hex, aes_iv_hex, content)
+}
+
+fn decrypt_region_msgpack<T>(
+    aes_key_hex: &str,
+    aes_iv_hex: &str,
+    content: &[u8],
+) -> Result<T, AssetExecutionError>
+where
+    T: for<'de> Deserialize<'de>,
+{
     if content.is_empty() {
         return Err(AssetExecutionError::EmptyEncryptedContent);
     }
@@ -1885,7 +2195,7 @@ pub fn decrypt_asset_bundle_info(
         }
     };
 
-    rmp_serde::from_slice::<AssetBundleInfo>(decrypted)
+    rmp_serde::from_slice::<T>(decrypted)
         .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))
 }
 
@@ -2040,6 +2350,8 @@ mod tests {
     #[test]
     fn haruki_3d_work_root_is_disabled_by_default() {
         let region = test_region(RegionProviderConfig::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
             asset_info_url_template: "https://example.com/info".to_string(),
             asset_bundle_url_template: "https://example.com/{bundle_path}".to_string(),
             profile: "production".to_string(),
@@ -2069,6 +2381,8 @@ mod tests {
     fn haruki_3d_tasks_follow_downloaded_record_hashes() {
         let temp = tempdir().unwrap();
         let mut region = test_region(RegionProviderConfig::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
             asset_info_url_template: "https://example.com/info".to_string(),
             asset_bundle_url_template: "https://example.com/{bundle_path}".to_string(),
             profile: "production".to_string(),
@@ -2245,6 +2559,8 @@ mod tests {
     #[test]
     fn download_filters_match_go_logic() {
         let region = test_region(RegionProviderConfig::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
             asset_info_url_template: "".to_string(),
             asset_bundle_url_template: "".to_string(),
             profile: "production".to_string(),
@@ -2362,6 +2678,8 @@ mod tests {
         let region = RegionConfig {
             enabled: true,
             provider: RegionProviderConfig::ColorfulPalette {
+                current_version_url: None,
+                game_version_url_template: None,
                 asset_info_url_template: format!(
                     "http://{addr}/info/{{env}}/{{hash}}/{{asset_version}}/{{asset_hash}}"
                 ),
@@ -2532,6 +2850,7 @@ mod tests {
         let region = RegionConfig {
             enabled: true,
             provider: RegionProviderConfig::Nuverse {
+                current_version_url: None,
                 asset_version_url: format!("http://{addr}/version/{{app_version}}"),
                 app_version: "5.2.0".to_string(),
                 asset_info_url_template: format!(
@@ -2682,6 +3001,8 @@ mod tests {
         let region = RegionConfig {
             enabled: true,
             provider: RegionProviderConfig::ColorfulPalette {
+                current_version_url: None,
+                game_version_url_template: None,
                 asset_info_url_template: format!(
                     "http://{addr}/info/{{env}}/{{hash}}/{{asset_version}}/{{asset_hash}}"
                 ),

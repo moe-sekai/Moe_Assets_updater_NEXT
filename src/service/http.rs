@@ -1,3 +1,11 @@
+//! Minimal HTTP sidecar. Only exposes `/healthz` and `/trigger/{region}`.
+//!
+//! The main workload runs inside `Poller` on its own tasks; this HTTP layer
+//! only provides:
+//!   * `/healthz` — liveness + per-region last tick / last commit info.
+//!   * `/trigger/{region}` — force the poller to run a region on its next
+//!     immediate wake-up. Requires bearer token when auth is enabled.
+
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -6,26 +14,29 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::core::config::AppConfig;
-use crate::core::errors::RegionError;
-use crate::core::models::{AssetUpdateRequest, JobSnapshot};
-use crate::service::jobs::{JobListSummary, JobManager};
 use crate::service::logging::access_log_middleware;
+use crate::service::poller::PollerHandle;
+use crate::service::watermark::RegionWatermark;
 
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<AppConfig>,
-    jobs: JobManager,
+    poller: PollerHandle,
+    started_at: DateTime<Utc>,
 }
 
 impl AppState {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        let jobs = JobManager::new(config.clone());
-        Self { config, jobs }
+    pub fn new(config: Arc<AppConfig>, poller: PollerHandle) -> Self {
+        Self {
+            config,
+            poller,
+            started_at: Utc::now(),
+        }
     }
 
     pub fn config(&self) -> &Arc<AppConfig> {
@@ -36,10 +47,7 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v2/assets/update", post(submit_update))
-        .route("/v2/jobs", get(list_jobs))
-        .route("/v2/jobs/{job_id}", get(get_job))
-        .route("/v2/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/trigger/{region}", post(trigger))
         .layer(from_fn_with_state(state.clone(), access_log_middleware))
         .with_state(state)
 }
@@ -48,100 +56,81 @@ pub fn build_router(state: AppState) -> Router {
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
+    version: &'static str,
+    started_at: DateTime<Utc>,
     config_version: u32,
     enabled_regions: Vec<String>,
+    regions: Vec<RegionHealth>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegionHealth {
+    region: String,
+    last_tick_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    in_flight: bool,
+    watermark: Option<RegionWatermark>,
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
+    let region_snapshots = state.poller.region_snapshots().await;
+    let regions = region_snapshots
+        .into_iter()
+        .map(|snap| RegionHealth {
+            region: snap.region,
+            last_tick_at: snap.last_tick_at,
+            last_success_at: snap.last_success_at,
+            last_error: snap.last_error,
+            in_flight: snap.in_flight,
+            watermark: snap.watermark,
+        })
+        .collect();
     Json(HealthResponse {
         status: "ok",
         service: "haruki-sekai-asset-updater",
+        version: env!("CARGO_PKG_VERSION"),
+        started_at: state.started_at,
         config_version: state.config.config_version,
         enabled_regions: state.config.enabled_regions(),
+        regions,
     })
 }
 
 #[derive(Debug, Serialize)]
-struct SubmitUpdateResponse {
+struct TriggerResponse {
     message: String,
-    job: JobSnapshot,
+    region: String,
 }
 
-async fn submit_update(
+async fn trigger(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<AssetUpdateRequest>,
-) -> Result<(StatusCode, Json<SubmitUpdateResponse>), ApiError> {
+    Path(region): Path<String>,
+) -> Result<(StatusCode, Json<TriggerResponse>), ApiError> {
     authorize(&state.config, &headers)?;
-
-    let job = state.jobs.submit(request).await.map_err(ApiError::from)?;
+    if !state.config.regions.contains_key(&region) {
+        return Err(ApiError::NotFound(format!("region `{region}` not defined")));
+    }
+    if !state
+        .config
+        .regions
+        .get(&region)
+        .map(|cfg| cfg.enabled)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::Conflict(format!(
+            "region `{region}` is disabled in config"
+        )));
+    }
+    state.poller.trigger(&region).await;
     Ok((
         StatusCode::ACCEPTED,
-        Json(SubmitUpdateResponse {
-            message: "job accepted".to_string(),
-            job,
+        Json(TriggerResponse {
+            message: "trigger accepted".to_string(),
+            region,
         }),
     ))
-}
-
-#[derive(Debug, Serialize)]
-struct JobResponse {
-    job: JobSnapshot,
-}
-
-async fn get_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(job_id): Path<Uuid>,
-) -> Result<Json<JobResponse>, ApiError> {
-    authorize(&state.config, &headers)?;
-
-    let job = state
-        .jobs
-        .get(job_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("job `{job_id}` not found")))?;
-    Ok(Json(JobResponse { job }))
-}
-
-async fn list_jobs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<JobListSummary>, ApiError> {
-    authorize(&state.config, &headers)?;
-    let summary = state.jobs.list().await;
-    Ok(Json(summary))
-}
-
-async fn cancel_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(job_id): Path<Uuid>,
-) -> Result<(StatusCode, Json<SubmitUpdateResponse>), ApiError> {
-    authorize(&state.config, &headers)?;
-
-    if !state.config.execution.allow_cancel {
-        return Err(ApiError::Conflict(
-            "job cancellation is disabled by configuration".to_string(),
-        ));
-    }
-
-    let result = state
-        .jobs
-        .cancel(job_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("job `{job_id}` not found")))?;
-
-    match result {
-        Ok(job) => Ok((
-            StatusCode::ACCEPTED,
-            Json(SubmitUpdateResponse {
-                message: "job cancellation requested".to_string(),
-                job,
-            }),
-        )),
-        Err(message) => Err(ApiError::Conflict(message)),
-    }
 }
 
 fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -149,7 +138,6 @@ fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ApiError> {
     if !auth.enabled {
         return Ok(());
     }
-
     if let Some(prefix) = &auth.user_agent_prefix {
         let user_agent = headers
             .get(axum::http::header::USER_AGENT)
@@ -159,7 +147,6 @@ fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ApiError> {
             return Err(ApiError::Unauthorized("invalid user-agent".to_string()));
         }
     }
-
     if let Some(token) = &auth.bearer_token {
         let authorization = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -169,7 +156,6 @@ fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ApiError> {
             return Err(ApiError::Unauthorized("invalid bearer token".to_string()));
         }
     }
-
     Ok(())
 }
 
@@ -180,15 +166,6 @@ enum ApiError {
     Conflict(String),
 }
 
-impl From<RegionError> for ApiError {
-    fn from(value: RegionError) -> Self {
-        match value {
-            RegionError::NotFound(_) => Self::NotFound(value.to_string()),
-            RegionError::Disabled(_) => Self::Conflict(value.to_string()),
-        }
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -196,7 +173,6 @@ impl IntoResponse for ApiError {
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
         };
-
         warn!(status = %status, error = %message, "request failed");
         (status, Json(sonic_rs::json!({ "message": message }))).into_response()
     }

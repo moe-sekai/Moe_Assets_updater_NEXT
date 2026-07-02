@@ -35,3 +35,9 @@ haruki-sekai-asset-updater
 
 # Nested worktrees
 cricodecs/target/
+CLAUDE.md
+scripts/
+reports/
+.narrafork/
+.venv/
+.venv-hash-compare/

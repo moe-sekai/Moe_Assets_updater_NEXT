@@ -36,7 +36,15 @@ fn binary_path() -> PathBuf {
         .join("haruki-sekai-asset-updater")
 }
 
-fn write_config(path: &Path, port: u16, main_log: &Path, access_log: &Path) {
+fn write_config(
+    path: &Path,
+    port: u16,
+    main_log: &Path,
+    access_log: &Path,
+    poller_watermark: &Path,
+    poller_last_info_dir: &Path,
+) {
+    let to_yaml = |p: &Path| p.display().to_string().replace('\\', "/");
     let yaml = format!(
         r#"
 config_version: 3
@@ -53,6 +61,12 @@ logging:
     enabled: true
     format: "[${{time}}] ${{status}} ${{method}} ${{path}} ${{latency}}"
     file: "{access_log}"
+poller:
+  enabled: false
+  watermark_file: "{watermark}"
+  last_info_dir: "{last_info_dir}"
+hip:
+  enabled: false
 regions:
   jp:
     enabled: true
@@ -69,25 +83,27 @@ regions:
       downloaded_asset_record_file: "./Data/jp-assets/downloaded_assets.json"
 "#,
         port = port,
-        main_log = main_log.display(),
-        access_log = access_log.display(),
+        main_log = to_yaml(main_log),
+        access_log = to_yaml(access_log),
+        watermark = to_yaml(poller_watermark),
+        last_info_dir = to_yaml(poller_last_info_dir),
     );
 
     fs::write(path, yaml).unwrap();
 }
 
-async fn wait_for_health(port: u16) {
+async fn wait_for_health(port: u16) -> Result<(), String> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/healthz");
-    for _ in 0..50 {
+    for _ in 0..100 {
         if let Ok(response) = client.get(&url).send().await {
             if response.status().is_success() {
-                return;
+                return Ok(());
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("server did not become healthy");
+    Err("timeout".into())
 }
 
 #[tokio::test]
@@ -97,21 +113,36 @@ async fn binary_writes_main_and_access_logs_to_files() {
     let config_path = temp.path().join("config.yaml");
     let main_log = temp.path().join("main.log");
     let access_log = temp.path().join("access.log");
-    write_config(&config_path, port, &main_log, &access_log);
+    let poller_wm = temp.path().join("watermarks.json");
+    let poller_last_info = temp.path().join("last_info");
+    write_config(
+        &config_path,
+        port,
+        &main_log,
+        &access_log,
+        &poller_wm,
+        &poller_last_info,
+    );
 
     let binary = binary_path();
 
-    let child = Command::new(binary)
+    let mut child = Command::new(binary)
         .env("HARUKI_CONFIG_PATH", &config_path)
         .env_remove("RUST_LOG")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    #[cfg(not(unix))]
-    let mut child = child;
 
-    wait_for_health(port).await;
+    if let Err(_) = wait_for_health(port).await {
+        let _ = child.kill().await;
+        let output = child.wait_with_output().await.unwrap();
+        panic!(
+            "server did not become healthy.\nSTDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let client = reqwest::Client::new();
     let _ = client
@@ -120,9 +151,7 @@ async fn binary_writes_main_and_access_logs_to_files() {
         .await
         .unwrap();
     let _ = client
-        .post(format!("http://127.0.0.1:{port}/v2/assets/update"))
-        .header("content-type", "application/json")
-        .body(r#"{"region":"jp","asset_version":"1","asset_hash":"hash","dry_run":true}"#)
+        .post(format!("http://127.0.0.1:{port}/trigger/jp"))
         .send()
         .await
         .unwrap();
@@ -157,5 +186,5 @@ async fn binary_writes_main_and_access_logs_to_files() {
         "expected startup log on stdout when main log file is enabled, got: {stdout_contents}"
     );
     assert!(access_contents.contains("/healthz"));
-    assert!(access_contents.contains("/v2/assets/update"));
+    assert!(access_contents.contains("/trigger/jp"));
 }

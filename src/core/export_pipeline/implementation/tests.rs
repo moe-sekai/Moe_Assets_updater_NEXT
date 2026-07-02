@@ -58,6 +58,8 @@ fn processing_config() -> (AppConfig, RegionConfig) {
     let region = RegionConfig {
         enabled: true,
         provider: RegionProviderConfig::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
             asset_info_url_template:
                 "https://example.com/{env}/{hash}/{asset_version}/{asset_hash}".to_string(),
             asset_bundle_url_template: "https://example.com/{bundle_path}".to_string(),

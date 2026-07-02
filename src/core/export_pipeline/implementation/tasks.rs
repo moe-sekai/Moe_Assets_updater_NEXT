@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn asset_studio_export_type_list(region: &RegionConfig) -> Vec<String> {
+pub(super) fn asset_studio_export_type_list(
+    region: &RegionConfig,
+    bundle_path: &str,
+) -> Vec<String> {
     let mut export_types = Vec::new();
     for asset_type in &region.export.asset_studio_types {
         let asset_type = asset_type.trim();
@@ -12,13 +15,27 @@ pub(super) fn asset_studio_export_type_list(region: &RegionConfig) -> Vec<String
     }
 
     if export_types.is_empty() {
-        DEFAULT_ASSET_STUDIO_EXPORT_TYPES
+        export_types = DEFAULT_ASSET_STUDIO_EXPORT_TYPES
             .iter()
             .map(|value| (*value).to_string())
-            .collect()
-    } else {
-        export_types
+            .collect();
     }
+
+    if should_export_mesh_for_bundle(region, bundle_path)
+        && !export_types.iter().any(|value| value == "mesh")
+    {
+        export_types.push("mesh".to_string());
+    }
+
+    export_types
+}
+
+fn should_export_mesh_for_bundle(region: &RegionConfig, bundle_path: &str) -> bool {
+    if !region.export.mesh.export_obj || region.export.mesh.path_patterns.is_empty() {
+        return false;
+    }
+    let patterns = compile_patterns(&region.export.mesh.path_patterns);
+    matches_any(&patterns, bundle_path)
 }
 
 pub(super) fn run_path_tasks<F>(

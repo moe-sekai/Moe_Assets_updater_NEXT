@@ -36,7 +36,7 @@ pub(super) async fn run_assetstudio_ffi_object_export(
     );
     let open_request = AssetStudioFfiContextOpenRequest {
         input_path: asset_bundle_file.to_string_lossy().to_string(),
-        asset_types: asset_studio_export_type_list(region),
+        asset_types: asset_studio_export_type_list(region, export_path),
         unity_version: (!region.runtime.unity_version.is_empty())
             .then(|| region.runtime.unity_version.clone()),
         filter_exclude_mode: false,
@@ -105,7 +105,7 @@ async fn call_assetstudio_ffi_object_export_direct(
     let cpu_budget_slot = acquire_cpu_budget_permit(app_config.effective_cpu_budget()).await?;
     let open_request = AssetStudioFfiContextOpenRequest {
         input_path: asset_bundle_file.to_string_lossy().to_string(),
-        asset_types: asset_studio_export_type_list(region),
+        asset_types: asset_studio_export_type_list(region, export_path),
         unity_version: (!region.runtime.unity_version.is_empty())
             .then(|| region.runtime.unity_version.clone()),
         filter_exclude_mode: false,
@@ -375,7 +375,8 @@ where
             &mut summary,
         )
         .await?;
-        let configured_asset_types = asset_studio_export_type_list(options.region);
+        let configured_asset_types =
+            asset_studio_export_type_list(options.region, options.export_path);
         let mut readable_assets =
             select_native_object_readable_assets(&assets, &configured_asset_types, &mut summary);
         sort_native_object_reads_for_failure_isolation(&mut readable_assets);

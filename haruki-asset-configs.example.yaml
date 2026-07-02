@@ -25,12 +25,44 @@ logging:
 
 execution:
   timeout_seconds: 300
-  allow_cancel: true
-  batch_save_size: 50
+  allow_cancel: true       # legacy; poller currently doesn't cancel mid-flight
+  batch_save_size: 50      # legacy; not used by the new HIP-based pipeline
   retry:
     attempts: 4
     initial_backoff_ms: 1000
     max_backoff_ms: 4000
+
+# =============================================================================
+# Poller: replaces the removed v2 job HTTP API. Every interval_seconds it
+# pulls current_version.json for each enabled region and, only if the
+# version differs from the persisted watermark, kicks off the full
+# execute + HIP upload pipeline for that region.
+# =============================================================================
+poller:
+  enabled: true
+  interval_seconds: 60
+  watermark_file: "./Data/poller/watermarks.json"
+  last_info_dir: "./Data/poller/last_info"
+  max_concurrent_regions: 5
+
+# =============================================================================
+# HIP/1 client: talks to the pjsk.moe dedup gateway. See docs/hip.md for the
+# protocol spec. Disable if you only want to run local exports.
+# =============================================================================
+hip:
+  enabled: true
+  endpoint: "127.0.0.1:7420"
+  bearer_token: "${env:HARUKI_HIP_TOKEN}"
+  tls:
+    enabled: false
+    ca_file: ""
+  handshake_timeout_ms: 5000
+  request_timeout_ms: 30000
+  max_frame_bytes: 16777216
+  chunk_size_bytes: 1048576
+  max_in_flight_uploads: 8
+  check_batch_size: 512
+  heartbeat_interval_seconds: 30
 
 backends:
   media:
@@ -52,6 +84,7 @@ backends:
     read_kinds: # optional per AssetStudio type selector
       Texture2D: image
       Sprite: image
+      Mesh: obj
       TextAsset: text_bytes
       MonoBehaviour: typetree_json
       AudioClip: audio
@@ -116,6 +149,8 @@ regions:
     enabled: false
     provider:
       kind: colorful_palette
+      current_version_url: "https://raw.githubusercontent.com/Team-Haruki/haruki-sekai-master/main/versions/current_version.json"
+      game_version_url_template: "https://game-version.sekai.colorfulpalette.org/{app_version}/{app_hash}"
       asset_info_url_template: ""
       asset_bundle_url_template: ""
       profile: "production"
@@ -183,6 +218,12 @@ regions:
           - "^live_pv/model/characterv2/color_variation/head_optional/"
           - "^character/motion/costume_setting/"
         exclude: []
+      mesh:
+        export_obj: false
+        path_patterns:
+          - "^mysekai/custom_fixture_attach(?:/|$)"
+          - "^mysekai/fixture(?:/|$)"
+          - "^mysekai/site/field/my_room_asset/skin(?:/|$)"
       haruki_3d:
         enabled: false
         exporter_path: "/app/haruki-3d/exporter/Haruki-3D-Exporter"
@@ -204,18 +245,15 @@ regions:
         exclude: []
         cleanup_work_dir_after_success: true
         cleanup_work_dir_after_failure: true
-    upload:
-      enabled: false
-      providers: []
-      public_read:
-        include: []
-        exclude: []
-      remove_local_after_upload: false
+    # Note: regions.*.upload is legacy (S3 via OpenDAL). The HIP client is
+    # the primary upload path now — see the top-level `hip:` block. Leaving
+    # this section out (or `enabled: false`) is the recommended default.
 
   cn:
     enabled: false
     provider:
       kind: nuverse
+      current_version_url: "https://raw.githubusercontent.com/Team-Haruki/haruki-sekai-sc-master/main/versions/current_version.json"
       asset_version_url: "https://lf3-mkcncdn-tos.dailygn.com/obj/rt-game-lf/gdl_app_5236/Mainland/{app_version}/Release/cn_online/ios/version"
       app_version: "5.2.0"
       asset_info_url_template: "https://lf3-mkcncdn-tos.dailygn.com/obj/sf-game-lf/gdl_app_5236/AssetBundle/{app_version}/Release/cn_online/ios{asset_version}/AssetBundleInfoNew.json"
@@ -254,10 +292,4 @@ regions:
         direct_mp4: false
       audio:
         formats: ["mp3"] # wav | flac | mp3
-    upload:
-      enabled: false
-      providers: []
-      public_read:
-        include: []
-        exclude: []
-      remove_local_after_upload: false
+    # See jp region above regarding the removed `upload:` section.
