@@ -211,6 +211,7 @@ pub(super) fn sample_process_tree_cpu_percent(
 pub(super) fn current_process_tree_cpu_percent() -> Result<f64, ExportPipelineError> {
     #[cfg(unix)]
     {
+        use std::process::Command as StdCommand;
         let output = StdCommand::new("ps")
             .args(["-axo", "pid=,ppid=,pcpu="])
             .output()
