@@ -113,6 +113,10 @@ pub fn diff(old: Option<&AssetBundleInfo>, new: &AssetBundleInfo) -> BundleDiff 
 }
 
 /// Persist a bundle info snapshot to `path` as zstd-compressed msgpack.
+///
+/// Writes atomically via `path + ".tmp"` + `rename`, so a crash mid-write can
+/// only leave the stale-but-valid previous snapshot in place, never a
+/// half-written file that would fail zstd decode on next load.
 pub fn save_snapshot(path: &Path, info: &AssetBundleInfo) -> Result<(), AssetExecutionError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| {
@@ -124,9 +128,62 @@ pub fn save_snapshot(path: &Path, info: &AssetBundleInfo) -> Result<(), AssetExe
         .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))?;
     let compressed = zstd::stream::encode_all(packed.as_slice(), 6)
         .map_err(|source| AssetExecutionError::BlockingTask(format!("zstd encode: {source}")))?;
-    std::fs::write(path, compressed).map_err(|source| {
-        AssetExecutionError::BlockingTask(format!("write last_info {path:?}: {source}"))
+    let tmp_path = {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
+    };
+    std::fs::write(&tmp_path, &compressed).map_err(|source| {
+        AssetExecutionError::BlockingTask(format!("write last_info tmp {tmp_path:?}: {source}"))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|source| {
+        // best-effort cleanup so a failed rename doesn't leak the tmp
+        let _ = std::fs::remove_file(&tmp_path);
+        AssetExecutionError::BlockingTask(format!(
+            "rename last_info tmp → target ({tmp_path:?} → {path:?}): {source}"
+        ))
     })
+}
+
+/// Merge `entries` into whatever snapshot currently lives at `path` and write
+/// atomically. Semantics:
+///
+/// * If `path` does not exist yet, or the existing snapshot's
+///   `(version, os)` does not match the caller-provided `(new_version,
+///   new_os)`, the existing snapshot is *discarded* (it belonged to a stale
+///   asset_version and would poison next-tick's layer-1 diff). A fresh
+///   snapshot containing only `entries` is written.
+///
+/// * Otherwise `entries` are merged in on top (same key → overwritten with
+///   the fresh detail), preserving everything already committed in prior
+///   batches.
+///
+/// This is the incremental-commit hook: called after every successful
+/// per-batch HIP commit so a crash between batches only loses the last
+/// un-committed batch, not the entire region.
+pub fn merge_snapshot(
+    path: &Path,
+    new_version: Option<&str>,
+    new_os: Option<&str>,
+    entries: &[(String, crate::core::asset_execution::AssetBundleDetail)],
+) -> Result<(), AssetExecutionError> {
+    let existing = load_snapshot(path)?;
+    let mut merged = match existing {
+        Some(prev)
+            if prev.version.as_deref() == new_version && prev.os.as_deref() == new_os =>
+        {
+            prev
+        }
+        _ => AssetBundleInfo {
+            version: new_version.map(str::to_string),
+            os: new_os.map(str::to_string),
+            bundles: HashMap::new(),
+        },
+    };
+    for (name, detail) in entries {
+        merged.bundles.insert(name.clone(), detail.clone());
+    }
+    save_snapshot(path, &merged)
 }
 
 pub fn load_snapshot(path: &Path) -> Result<Option<AssetBundleInfo>, AssetExecutionError> {
@@ -228,5 +285,152 @@ mod tests {
         save_snapshot(&path, &info).unwrap();
         let loaded = load_snapshot(&path).unwrap().unwrap();
         assert_eq!(loaded.bundles.len(), 1);
+    }
+
+    #[test]
+    fn save_snapshot_writes_atomically_without_leaking_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path().to_str().unwrap(), "jp");
+        let mut info = AssetBundleInfo {
+            version: Some("1".into()),
+            os: None,
+            bundles: Default::default(),
+        };
+        info.bundles.insert("music/foo".into(), detail(100, 10));
+        save_snapshot(&path, &info).unwrap();
+
+        // Target file exists and decodes.
+        assert!(path.exists(), "snapshot target file should exist");
+        let _ = load_snapshot(&path).unwrap().unwrap();
+
+        // The `.tmp` sibling must not linger — save_snapshot must have
+        // rename()d it into place, not left it behind.
+        let tmp_path = {
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            PathBuf::from(tmp)
+        };
+        assert!(
+            !tmp_path.exists(),
+            "atomic-write tmp sibling should not be left behind after successful save"
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_creates_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path().to_str().unwrap(), "jp");
+        // Sanity: nothing to load yet.
+        assert!(load_snapshot(&path).unwrap().is_none());
+
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            Some("ios"),
+            &[
+                ("music/foo".into(), detail(100, 10)),
+                ("music/bar".into(), detail(200, 20)),
+            ],
+        )
+        .unwrap();
+
+        let loaded = load_snapshot(&path).unwrap().unwrap();
+        assert_eq!(loaded.version.as_deref(), Some("6.6.0.20"));
+        assert_eq!(loaded.os.as_deref(), Some("ios"));
+        assert_eq!(loaded.bundles.len(), 2);
+        assert_eq!(loaded.bundles["music/foo"].crc, 100);
+        assert_eq!(loaded.bundles["music/bar"].crc, 200);
+    }
+
+    #[test]
+    fn merge_snapshot_accumulates_across_batches_within_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path().to_str().unwrap(), "jp");
+
+        // Batch 1
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            Some("ios"),
+            &[("music/foo".into(), detail(100, 10))],
+        )
+        .unwrap();
+        // Batch 2 (same version): must accumulate on top of batch 1.
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            Some("ios"),
+            &[
+                ("music/bar".into(), detail(200, 20)),
+                ("music/baz".into(), detail(300, 30)),
+            ],
+        )
+        .unwrap();
+
+        let loaded = load_snapshot(&path).unwrap().unwrap();
+        assert_eq!(loaded.bundles.len(), 3);
+        assert_eq!(loaded.bundles["music/foo"].crc, 100);
+        assert_eq!(loaded.bundles["music/bar"].crc, 200);
+        assert_eq!(loaded.bundles["music/baz"].crc, 300);
+    }
+
+    #[test]
+    fn merge_snapshot_overwrites_existing_key_within_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path().to_str().unwrap(), "jp");
+
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            None,
+            &[("music/foo".into(), detail(100, 10))],
+        )
+        .unwrap();
+        // Same key with a different fingerprint → the newer one wins.
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            None,
+            &[("music/foo".into(), detail(999, 11))],
+        )
+        .unwrap();
+
+        let loaded = load_snapshot(&path).unwrap().unwrap();
+        assert_eq!(loaded.bundles.len(), 1);
+        assert_eq!(loaded.bundles["music/foo"].crc, 999);
+        assert_eq!(loaded.bundles["music/foo"].file_size, 11);
+    }
+
+    #[test]
+    fn merge_snapshot_discards_stale_snapshot_when_asset_version_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path().to_str().unwrap(), "jp");
+
+        // Old version snapshot.
+        merge_snapshot(
+            &path,
+            Some("6.6.0.20"),
+            Some("ios"),
+            &[
+                ("music/foo".into(), detail(100, 10)),
+                ("music/bar".into(), detail(200, 20)),
+            ],
+        )
+        .unwrap();
+
+        // New asset_version: everything old must be dropped, only the new
+        // entries survive.
+        merge_snapshot(
+            &path,
+            Some("6.7.0.0"),
+            Some("ios"),
+            &[("music/baz".into(), detail(300, 30))],
+        )
+        .unwrap();
+
+        let loaded = load_snapshot(&path).unwrap().unwrap();
+        assert_eq!(loaded.version.as_deref(), Some("6.7.0.0"));
+        assert_eq!(loaded.bundles.len(), 1);
+        assert!(loaded.bundles.contains_key("music/baz"));
     }
 }

@@ -63,6 +63,16 @@ hip:
   max_in_flight_uploads: 8
   check_batch_size: 512
   heartbeat_interval_seconds: 30
+  # Streaming commit: every N successfully-uploaded bundles (or M total bytes,
+  # whichever hits first) the client sends a COMMIT, opens a fresh session for
+  # the rest, and flushes the layer1 snapshot on disk. This keeps memory bounded,
+  # makes uploaded data visible via the gateway as soon as each batch commits,
+  # and — critically — lets a mid-poll crash resume from the last commit instead
+  # of re-processing the entire region.
+  # Set either to 0 to disable that trigger. Setting both to 0 restores the
+  # legacy "one COMMIT at the end of the region" behaviour.
+  commit_batch_bundles: 500
+  commit_batch_bytes: 536870912   # 512 MiB
 
 backends:
   media:

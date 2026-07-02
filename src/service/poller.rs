@@ -315,7 +315,13 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
 
     // Layer 2 + execute
     let run_id = uuid::Uuid::new_v4().to_string();
-    let mut hip_session = if ctx.config.hip.enabled {
+    // A dedicated *check* session lives for the whole region-poll: it never
+    // sends UPLOAD_BEGIN / COMMIT, so the server-side state machine stays in
+    // stateHandshaked / stateRunning and we can keep reusing it. Upload
+    // sessions are opened one-per-batch by the uploader task below (a HIP
+    // session can only COMMIT once — after COMMIT it becomes stateFinalized
+    // and rejects further CHECK / UPLOAD / COMMIT).
+    let check_session = if ctx.config.hip.enabled {
         Some(connect_hip(ctx, &current, &run_id).await?)
     } else {
         None
@@ -346,7 +352,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     let filter = CombinedFilter {
         layer1_allow: Arc::new(changed_names),
         layer1_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        hip: hip_session.as_ref().map(|session| HipCheckFilter {
+        hip: check_session.as_ref().map(|session| HipCheckFilter {
             session: session.clone(),
             region_name: ctx.region_name.clone(),
             check_batch_size: ctx.config.hip.check_batch_size.max(1),
@@ -356,11 +362,54 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     };
     let layer1_counter = filter.layer1_skipped.clone();
 
+    // Progress channel from executor → forwarder. Executor treats it as an
+    // unbounded sink (matches the existing API); forwarder converts to the
+    // bounded artefact channel so slow uploads eventually throttle downloads.
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let bundle_artefacts: Arc<tokio::sync::Mutex<Vec<BundleArtefacts>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let collector_artefacts = bundle_artefacts.clone();
-    let collector = tokio::spawn(async move {
+
+    // Uploader input channel. Bounded (32 = ~a few dozen bundles of runway)
+    // so upload lag can't let the artefact queue grow unbounded in memory —
+    // once full, the forwarder task blocks on `send`, and further executor
+    // `progress` sends pile up in the unbounded mpsc which is fine because
+    // each event is tiny (bundle path + few file paths).
+    let uploader_setup = if ctx.config.hip.enabled {
+        let (artefact_tx, artefact_rx) =
+            tokio::sync::mpsc::channel::<BundleArtefacts>(32);
+        let ctx_config = ctx.config.clone();
+        let region_name = ctx.region_name.clone();
+        let current_for_upload = current.clone();
+        let run_id_for_upload = run_id.clone();
+        let hip_config = ctx.config.hip.clone();
+        let snapshot_path_for_upload = snapshot_path.clone();
+        let new_info_for_upload = new_info.clone();
+        let layer1_skipped_at_filter_for_upload = layer1_counter.clone();
+        let check_skipped_counter_for_upload = check_skipped_counter.clone();
+        let cancel_for_upload = ctx.cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_uploader(
+                ctx_config,
+                region_name,
+                current_for_upload,
+                run_id_for_upload,
+                hip_config,
+                snapshot_path_for_upload,
+                new_info_for_upload,
+                artefact_rx,
+                layer1_skipped_at_filter_for_upload,
+                check_skipped_counter_for_upload,
+                cancel_for_upload,
+            )
+            .await
+        });
+        Some((artefact_tx, handle))
+    } else {
+        None
+    };
+
+    // Forwarder: bridges executor's unbounded progress channel → uploader's
+    // bounded artefact channel. Runs concurrently with the executor.
+    let artefact_tx_for_forwarder = uploader_setup.as_ref().map(|(tx, _)| tx.clone());
+    let forwarder = tokio::spawn(async move {
         while let Some(event) = progress_rx.recv().await {
             if let ExecutionProgressUpdate::BundleArtefactsProduced {
                 bundle,
@@ -369,12 +418,23 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
                 files,
             } = event
             {
-                collector_artefacts.lock().await.push(BundleArtefacts {
+                let art = BundleArtefacts {
                     bundle_path: bundle,
                     bundle_hash,
                     export_root,
                     files,
-                });
+                };
+                if let Some(tx) = &artefact_tx_for_forwarder {
+                    // If the uploader has died / dropped its rx, we silently
+                    // drop the event — those bundles won't be reflected in
+                    // the layer1 snapshot, so next tick they'll be seen as
+                    // changed and retried. That's the safe fallback.
+                    if tx.send(art).await.is_err() {
+                        // uploader gone; keep draining events so the executor
+                        // doesn't stall on its unbounded sender.
+                        continue;
+                    }
+                }
             }
         }
     });
@@ -388,7 +448,45 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         )
         .await
         .map_err(|err| PollError::Execution(err.to_string()))?;
-    let _ = collector.await;
+
+    // Drain forwarder — its `recv()` returns None once the executor drops
+    // its progress_tx, which happened inside execute_with_filter above.
+    let _ = forwarder.await;
+
+    // Signal uploader by dropping the last artefact sender (our copy lives
+    // inside `uploader_setup`); then await its final result.
+    let mut processed_bundles: HashSet<String> = check_skipped_bundles.lock().await.clone();
+    if let Some((artefact_tx, handle)) = uploader_setup {
+        drop(artefact_tx);
+        match handle.await {
+            Ok(Ok(uploaded)) => {
+                processed_bundles.extend(uploaded);
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    region = %ctx.region_name,
+                    error = %err,
+                    "uploader task failed; committed batches (if any) are still durable on the gateway",
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    region = %ctx.region_name,
+                    error = %join_err,
+                    "uploader task panicked",
+                );
+            }
+        }
+    }
+
+    // Close the long-lived check session cleanly.
+    if let Some(session) = check_session {
+        if let Ok(owned) = Arc::try_unwrap(session) {
+            let _ = owned.close().await;
+        }
+        // If try_unwrap fails there's a leaked filter clone somewhere; the
+        // writer task will exit on its own when the TCP connection drops.
+    }
 
     let layer1_skipped_at_filter = layer1_counter.load(std::sync::atomic::Ordering::Relaxed);
     debug!(
@@ -398,46 +496,13 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         "layer1 stats"
     );
 
-    // Upload export artefacts + commit.
-    let mut upload_stats = CommitStats {
-        skipped_by_layer1: layer1_skipped_at_filter,
-        skipped_by_check: check_skipped_counter.load(std::sync::atomic::Ordering::Relaxed),
-        uploaded_shared: 0,
-        uploaded_override: 0,
-    };
-    // Bundles that we can consider "processed" for the next diff:
-    //   - Layer 1 unchanged (kept as-is in old snapshot)
-    //   - Layer 2 SKIP hits (server already has them)
-    //   - Successfully uploaded this session
-    let mut processed_bundles: HashSet<String> = check_skipped_bundles.lock().await.clone();
-
-    if let Some(session) = hip_session.take() {
-        let artefacts = bundle_artefacts.lock().await.clone();
-        info!(
-            region = %ctx.region_name,
-            bundles = artefacts.len(),
-            files = artefacts.iter().map(|b| b.files.len()).sum::<usize>(),
-            "uploading export artefacts to HIP gateway"
-        );
-        let outcome = upload_bundle_artefacts(&ctx.region_name, &session, &artefacts).await?;
-        upload_stats.uploaded_shared += outcome.stats.uploaded_shared;
-        upload_stats.uploaded_override += outcome.stats.uploaded_override;
-        processed_bundles.extend(outcome.succeeded_bundles);
-        session
-            .commit(summary.completed_downloads as u64, upload_stats.clone())
-            .await
-            .map_err(|err| PollError::Hip(err.to_string()))?;
-        // Try to drain writer + send BYE cleanly. Because we still hold an
-        // Arc via `hip_session`, we need to unwrap ownership to call close().
-        // If we can't (unlikely, since only `session` holds a clone here),
-        // drop it — the writer will exit on its own when the connection tears down.
-        if let Ok(owned) = Arc::try_unwrap(session) {
-            let _ = owned.close().await;
-        }
-    }
-    let _ = upload_stats;
-
     // Persist watermark + Layer 1 snapshot for next tick's diff.
+    //
+    // Watermark is only bumped when the whole region-poll finishes, so a
+    // mid-poll crash leaves it stale → next tick re-runs the poll. The
+    // layer1 snapshot has been incrementally merged by the uploader after
+    // each successful commit, so a re-run's diff already skips whatever
+    // batches did land, and only the un-committed remainder is re-processed.
     let wm = RegionWatermark {
         asset_version: current.asset_version_or_default(),
         asset_hash: current.asset_hash_or_default(),
@@ -477,6 +542,284 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     }
 
     Ok(RunOutcome::Completed)
+}
+
+/// Streaming uploader: consumes `BundleArtefacts` from the executor, uploads
+/// them in bounded batches, and issues a HIP COMMIT every
+/// `commit_batch_bundles` bundles (or `commit_batch_bytes` bytes) so a
+/// crash mid-poll only loses the last un-committed batch.
+///
+/// Each COMMIT terminates the current session (HIP servers enforce
+/// commit-once-per-session), then a fresh session is opened for the next
+/// batch. The layer-1 snapshot is merged after every successful commit so
+/// the resume-after-crash path is entirely file-system driven.
+#[allow(clippy::too_many_arguments)]
+async fn run_uploader(
+    config: Arc<AppConfig>,
+    region_name: String,
+    current: CurrentVersionInfo,
+    run_id: String,
+    hip_config: crate::core::config::HipConfig,
+    snapshot_path: std::path::PathBuf,
+    new_info: crate::core::asset_execution::AssetBundleInfo,
+    mut artefact_rx: tokio::sync::mpsc::Receiver<BundleArtefacts>,
+    layer1_skipped_at_filter: Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_counter: Arc<std::sync::atomic::AtomicU64>,
+    cancel: CancellationToken,
+) -> Result<HashSet<String>, PollError> {
+    // Copy of the effective thresholds (either > 0 means the trigger is on).
+    let batch_bundles_threshold = hip_config.commit_batch_bundles;
+    let batch_bytes_threshold = hip_config.commit_batch_bytes;
+
+    let mut batch: Vec<BundleArtefacts> = Vec::new();
+    let mut batch_bytes: u64 = 0;
+    let mut processed_all: HashSet<String> = HashSet::new();
+    let mut batch_index: u32 = 0;
+    // Only the very first COMMIT carries the layer1/CHECK skip counters —
+    // those are region-wide totals, we don't want to double-count them.
+    let mut first_commit_pending = true;
+
+    let mut session_opt: Option<Arc<crate::core::hip::HipSession>> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!(region = %region_name, "uploader: cancel signalled, flushing residual batch and exiting");
+                break;
+            }
+            maybe = artefact_rx.recv() => {
+                match maybe {
+                    None => break, // executor + forwarder both done
+                    Some(art) => {
+                        // Best-effort byte accounting for the batch-bytes
+                        // threshold. Missing files (bundle got moved / cleaned)
+                        // just don't contribute — the bundle-count trigger
+                        // still applies.
+                        let bytes_this: u64 = art
+                            .files
+                            .iter()
+                            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                            .sum();
+                        batch_bytes += bytes_this;
+                        batch.push(art);
+
+                        let should_flush = (batch_bundles_threshold > 0
+                            && batch.len() >= batch_bundles_threshold)
+                            || (batch_bytes_threshold > 0
+                                && batch_bytes >= batch_bytes_threshold);
+                        if should_flush {
+                            batch_index += 1;
+                            flush_batch(
+                                &config,
+                                &region_name,
+                                &current,
+                                &run_id,
+                                &snapshot_path,
+                                &new_info,
+                                &mut session_opt,
+                                &mut batch,
+                                &mut batch_bytes,
+                                &mut processed_all,
+                                batch_index,
+                                &mut first_commit_pending,
+                                &layer1_skipped_at_filter,
+                                &check_skipped_counter,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Final residual batch (or first-ever batch if we never crossed a threshold).
+    if !batch.is_empty() {
+        batch_index += 1;
+        flush_batch(
+            &config,
+            &region_name,
+            &current,
+            &run_id,
+            &snapshot_path,
+            &new_info,
+            &mut session_opt,
+            &mut batch,
+            &mut batch_bytes,
+            &mut processed_all,
+            batch_index,
+            &mut first_commit_pending,
+            &layer1_skipped_at_filter,
+            &check_skipped_counter,
+        )
+        .await?;
+    } else if let Some(session_arc) = session_opt.take() {
+        // Nothing to commit — just say goodbye to whatever session was open
+        // (e.g. a batch had 0 successful uploads and we already closed it,
+        // or we never opened one). Best-effort.
+        if let Ok(owned) = Arc::try_unwrap(session_arc) {
+            let _ = owned.close().await;
+        }
+    }
+
+    Ok(processed_all)
+}
+
+/// Upload the current in-memory batch on the currently-held session
+/// (opening one if needed), COMMIT it, close the session, and merge the
+/// successfully-uploaded bundles into the on-disk layer-1 snapshot so a
+/// later crash can resume.
+#[allow(clippy::too_many_arguments)]
+async fn flush_batch(
+    config: &Arc<AppConfig>,
+    region_name: &str,
+    current: &CurrentVersionInfo,
+    run_id: &str,
+    snapshot_path: &std::path::Path,
+    new_info: &crate::core::asset_execution::AssetBundleInfo,
+    session_opt: &mut Option<Arc<crate::core::hip::HipSession>>,
+    batch: &mut Vec<BundleArtefacts>,
+    batch_bytes: &mut u64,
+    processed_all: &mut HashSet<String>,
+    batch_index: u32,
+    first_commit_pending: &mut bool,
+    layer1_skipped_at_filter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_counter: &Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(), PollError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    if session_opt.is_none() {
+        *session_opt = Some(connect_hip_with(config, region_name, current, run_id).await?);
+    }
+    let session = session_opt
+        .as_ref()
+        .expect("session must exist after connect_hip");
+
+    let bundles_in_batch = batch.len();
+    info!(
+        region = %region_name,
+        batch = batch_index,
+        bundles = bundles_in_batch,
+        files = batch.iter().map(|b| b.files.len()).sum::<usize>(),
+        bytes = *batch_bytes,
+        "uploading batch to HIP gateway",
+    );
+
+    let outcome = upload_bundle_artefacts(region_name, session, batch).await?;
+    let mut commit_stats = CommitStats {
+        skipped_by_layer1: 0,
+        skipped_by_check: 0,
+        uploaded_shared: outcome.stats.uploaded_shared,
+        uploaded_override: outcome.stats.uploaded_override,
+    };
+    if *first_commit_pending {
+        commit_stats.skipped_by_layer1 =
+            layer1_skipped_at_filter.load(std::sync::atomic::Ordering::Relaxed);
+        commit_stats.skipped_by_check =
+            check_skipped_counter.load(std::sync::atomic::Ordering::Relaxed);
+        *first_commit_pending = false;
+    }
+
+    let succeeded_bundles = outcome.succeeded_bundles.clone();
+
+    // COMMIT + close. `bundle_count` on COMMIT is a stats field the server
+    // records into `versions.stats_json`; we pass the number of bundles that
+    // just landed in this batch. Server treats each COMMIT as a new
+    // `versions` row scoped to (region, app_version, asset_version,
+    // asset_hash) — see hipserver `store.InsertVersion`. Multiple COMMITs
+    // for the same version-tuple are additive; each rebuilds the read-path
+    // index.
+    let session_arc = session_opt.take().expect("session_opt was Some");
+    session_arc
+        .commit(succeeded_bundles.len() as u64, commit_stats)
+        .await
+        .map_err(|err| PollError::Hip(err.to_string()))?;
+    if let Ok(owned) = Arc::try_unwrap(session_arc) {
+        let _ = owned.close().await;
+    }
+
+    // Merge the successfully-committed bundles into the on-disk snapshot so
+    // a subsequent crash resumes from here.
+    let details_this_batch: Vec<(String, crate::core::asset_execution::AssetBundleDetail)> =
+        succeeded_bundles
+            .iter()
+            .filter_map(|name| {
+                new_info
+                    .bundles
+                    .get(name)
+                    .map(|d| (name.clone(), d.clone()))
+            })
+            .collect();
+    if !details_this_batch.is_empty() {
+        if let Err(err) = bundle_diff::merge_snapshot(
+            snapshot_path,
+            new_info.version.as_deref(),
+            new_info.os.as_deref(),
+            &details_this_batch,
+        ) {
+            // Snapshot flush failure is not fatal — data on the gateway is
+            // durable, we just lose crash-recovery precision. Log and go.
+            warn!(
+                region = %region_name,
+                batch = batch_index,
+                error = %err,
+                "failed to merge layer1 snapshot after successful commit",
+            );
+        }
+    }
+
+    info!(
+        region = %region_name,
+        batch = batch_index,
+        uploaded_bundles = succeeded_bundles.len(),
+        total_batch_bundles = bundles_in_batch,
+        uploaded_shared = outcome.stats.uploaded_shared,
+        uploaded_override = outcome.stats.uploaded_override,
+        "batch committed",
+    );
+
+    processed_all.extend(succeeded_bundles);
+    batch.clear();
+    *batch_bytes = 0;
+    Ok(())
+}
+
+/// Copy of `connect_hip` that takes plain args instead of the poller's
+/// `RegionLoopCtx`, so the uploader task (spawned into 'static) can call it.
+async fn connect_hip_with(
+    config: &Arc<AppConfig>,
+    region_name: &str,
+    current: &CurrentVersionInfo,
+    run_id: &str,
+) -> Result<Arc<crate::core::hip::HipSession>, PollError> {
+    let hip_config = &config.hip;
+    let mut cfg = crate::core::hip::client::HipClientConfig {
+        endpoint: hip_config.endpoint.clone(),
+        bearer_token: hip_config.bearer_token.clone().unwrap_or_default(),
+        tls_enabled: hip_config.tls.enabled,
+        tls_ca_file: hip_config.tls.ca_file.clone(),
+        handshake_timeout: Duration::from_millis(hip_config.handshake_timeout_ms),
+        request_timeout: Duration::from_millis(hip_config.request_timeout_ms),
+        max_frame_bytes: hip_config.max_frame_bytes,
+        chunk_size_bytes: hip_config.chunk_size_bytes,
+        heartbeat_interval: Duration::from_secs(hip_config.heartbeat_interval_seconds.max(1)),
+        unpacker_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    cfg.chunk_size_bytes = cfg.chunk_size_bytes.max(64 * 1024);
+    let hello = HelloParams {
+        region: region_name.to_string(),
+        app_version: current.app_version_or_default(),
+        asset_version: current.asset_version_or_default(),
+        asset_hash: current.asset_hash_or_default(),
+        run_id: run_id.to_string(),
+    };
+    let session = HipClient::connect(cfg, hello)
+        .await
+        .map_err(|err| PollError::Hip(err.to_string()))?;
+    Ok(Arc::new(session))
 }
 
 /// Return an `AssetBundleInfo` suitable for persisting as the next

@@ -95,6 +95,18 @@ pub struct HipConfig {
     pub max_in_flight_uploads: u32,
     pub check_batch_size: usize,
     pub heartbeat_interval_seconds: u64,
+    /// Streaming-upload knob: after this many artefact-producing bundles
+    /// have been uploaded, force a HIP COMMIT + open a fresh session for
+    /// the remaining bundles. Also triggers an incremental `last_info`
+    /// snapshot flush so a subsequent crash resumes from the last commit.
+    ///
+    /// Set to 0 to disable batching (fall back to the legacy behaviour of
+    /// one commit at the very end of a region-poll). The default of 500
+    /// keeps memory footprint modest while amortising commit overhead.
+    pub commit_batch_bundles: usize,
+    /// Sibling of `commit_batch_bundles`. Whichever threshold fires first
+    /// triggers the commit. `0` disables the byte-based trigger.
+    pub commit_batch_bytes: u64,
 }
 
 impl Default for HipConfig {
@@ -111,6 +123,8 @@ impl Default for HipConfig {
             max_in_flight_uploads: 8,
             check_batch_size: 512,
             heartbeat_interval_seconds: 30,
+            commit_batch_bundles: 500,
+            commit_batch_bytes: 512 * 1024 * 1024,
         }
     }
 }
