@@ -70,7 +70,7 @@ impl WatermarkStore {
     ) -> Result<(), AssetExecutionError> {
         let mut guard = self.inner.lock().await;
         guard.regions.insert(region.to_string(), watermark);
-        write_atomic(&self.path, &*guard).await
+        write_atomic(&self.path, &guard).await
     }
 
     pub async fn snapshot(&self) -> WatermarkFile {
