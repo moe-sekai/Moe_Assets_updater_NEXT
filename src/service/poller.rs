@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -111,8 +111,10 @@ impl Poller {
     pub async fn run(self, cancel: CancellationToken) {
         let interval_secs = self.config.poller.interval_seconds.max(5);
         let enabled_regions = self.config.enabled_regions();
+        let max_concurrent = self.config.poller.max_concurrent_regions.max(1);
         info!(
             interval_seconds = interval_secs,
+            max_concurrent_regions = max_concurrent,
             regions = ?enabled_regions,
             "poller starting"
         );
@@ -128,6 +130,11 @@ impl Poller {
             }
         }
 
+        // Shared semaphore: caps the number of regions that may run a full
+        // execution simultaneously. Layer-0 (watermark) skips do not take a
+        // permit — only actual asset processing does.
+        let region_permits = Arc::new(Semaphore::new(max_concurrent));
+
         let mut tasks = Vec::new();
         for region in enabled_regions {
             let ctx = RegionLoopCtx {
@@ -138,6 +145,7 @@ impl Poller {
                 cancel: cancel.clone(),
                 region_name: region.clone(),
                 interval: Duration::from_secs(interval_secs),
+                region_permits: region_permits.clone(),
             };
             tasks.push(tokio::spawn(async move { run_region_loop(ctx).await }));
         }
@@ -159,6 +167,7 @@ struct RegionLoopCtx {
     cancel: CancellationToken,
     region_name: String,
     interval: Duration,
+    region_permits: Arc<Semaphore>,
 }
 
 async fn run_region_loop(mut ctx: RegionLoopCtx) {
@@ -244,19 +253,22 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     let region = select_region(&ctx.config, &ctx.region_name)
         .map_err(|err| PollError::Config(err.to_string()))?;
 
-    let request = AssetUpdateRequest {
-        region: ctx.region_name.clone(),
-        asset_version: None,
-        asset_hash: None,
-        dry_run: false,
-        mode: AssetUpdateMode::Update,
-    };
-
     // Layer 0: fetch current_version.json and compare against watermark.
     let http_client = build_reusable_client(&ctx.config)?;
     let current = fetch_current_version_info(&http_client, region, &ctx.region_name)
         .await
         .map_err(|err| PollError::Execution(err.to_string()))?;
+
+    // Pass the already-resolved asset_version / asset_hash into the request so
+    // the executor doesn't need to re-fetch current_version.json (and won't
+    // report MissingAssetVersionOrHash if that second fetch is flaky).
+    let request = AssetUpdateRequest {
+        region: ctx.region_name.clone(),
+        asset_version: current.asset_version.clone(),
+        asset_hash: current.asset_hash.clone(),
+        dry_run: false,
+        mode: AssetUpdateMode::Update,
+    };
 
     if let Some(watermark) = ctx.watermarks.get(&ctx.region_name).await {
         if !watermark.asset_version.is_empty()
@@ -266,6 +278,19 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
             return Ok(RunOutcome::SkippedByWatermark);
         }
     }
+
+    // Acquire a region-execution permit before doing any heavy work. This is
+    // what makes `poller.max_concurrent_regions` actually cap parallelism —
+    // Layer-0 watermark skips above never take a permit, so idle regions don't
+    // block busy ones. If cancellation fires while waiting, bail cleanly.
+    let _permit = tokio::select! {
+        permit = ctx.region_permits.clone().acquire_owned() => permit
+            .map_err(|err| PollError::Execution(format!("region semaphore closed: {err}")))?,
+        _ = ctx.cancel.cancelled() => {
+            debug!(region = %ctx.region_name, "poll aborted while waiting for region permit");
+            return Ok(RunOutcome::SkippedByWatermark);
+        }
+    };
 
     // Layer 1: fetch full AssetBundleInfo, diff against the previous
     // committed snapshot. `changed` = bundles that are either new or whose
