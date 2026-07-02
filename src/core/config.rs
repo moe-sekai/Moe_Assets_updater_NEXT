@@ -1952,7 +1952,7 @@ impl Default for VideoExportConfig {
     fn default() -> Self {
         Self {
             formats: vec![VideoOutputFormat::Mp4],
-            direct_mp4: false,
+            direct_mp4: true,
         }
     }
 }

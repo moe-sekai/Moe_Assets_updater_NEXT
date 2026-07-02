@@ -1602,12 +1602,14 @@ impl AssetExecutionContext {
                 }
             })?;
         }
-        std::fs::write(&temp_file, deobfuscated).map_err(|source| {
+        std::fs::write(&temp_file, &deobfuscated).map_err(|source| {
             AssetExecutionError::WriteTempFile {
                 path: temp_file.clone(),
                 source,
             }
         })?;
+        drop(deobfuscated);
+        drop(body);
         Self::send_progress(
             progress,
             ExecutionProgressUpdate::BundleTempWritten {
@@ -1632,12 +1634,30 @@ impl AssetExecutionContext {
         )
         .await;
         let _ = remove_file_if_exists(&temp_file);
+        let mut payload_export = payload_export?;
+        let pending_image_writes = std::mem::take(&mut payload_export.pending_image_writes);
+        if !pending_image_writes.is_empty() {
+            let image_app_config = app_config.clone();
+            let image_phase_ms = tokio::task::spawn_blocking(move || {
+                flush_pending_native_image_writes(&image_app_config, pending_image_writes)
+            })
+            .await
+            .map_err(|source| {
+                AssetExecutionError::ExportPipeline(
+                    crate::core::errors::ExportPipelineError::WorkerPanic {
+                        worker: "native image flush".to_string(),
+                        message: source.to_string(),
+                    },
+                )
+            })??;
+            payload_export.ffi_export_phase_ms.extend(image_phase_ms);
+        }
 
         Ok(NativeBundlePostProcessJob {
             bundle_path: task.bundle_path.clone(),
             bundle_hash: task.bundle_hash.clone(),
             export_started,
-            payload_export: payload_export?,
+            payload_export,
             backlog_wait_ms: 0,
             _backlog_permit: None,
             _memory_permit: None,

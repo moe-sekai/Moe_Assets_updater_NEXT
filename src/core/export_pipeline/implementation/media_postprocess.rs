@@ -100,24 +100,24 @@ pub async fn post_process_exported_files(
     };
     let acb_concurrency = concurrency.acb;
     let acb_scoped_files = scoped_files.to_vec();
-    let usm_output = async {
-        let phase_started = Instant::now();
-        let mut output = handle_usm_files(
-            export_path,
-            region,
-            &app_config.backends.media.ffmpeg_path,
-            app_config.backends.media.backend,
-            &app_config.execution.retry,
-            concurrency.usm,
-            concurrency.video_encode,
-            cpu_budget,
-            scoped_post_process,
-            scoped_files,
-        )
-        .await?;
-        record_phase_ms(&mut output.phase_ms, "post_process.usm", phase_started);
-        Ok::<_, ExportPipelineError>(output)
-    };
+    let phase_started = Instant::now();
+    let mut usm_output = handle_usm_files(
+        export_path,
+        region,
+        &app_config.backends.media.ffmpeg_path,
+        app_config.backends.media.backend,
+        &app_config.execution.retry,
+        concurrency.usm,
+        concurrency.video_encode,
+        cpu_budget,
+        scoped_post_process,
+        scoped_files,
+    )
+    .await?;
+    record_phase_ms(&mut usm_output.phase_ms, "post_process.usm", phase_started);
+    summary.generated_files.extend(usm_output.generated_files);
+    merge_raw_phase_ms(&mut summary.post_process_phase_ms, &usm_output.phase_ms);
+
     let acb_output = tokio::task::spawn_blocking(move || {
         let phase_started = Instant::now();
         let mut output = handle_acb_files_owned(
@@ -129,13 +129,9 @@ pub async fn post_process_exported_files(
         )?;
         record_phase_ms(&mut output.phase_ms, "post_process.acb", phase_started);
         Ok::<_, ExportPipelineError>(output)
-    });
-    let (usm_output, acb_output) = tokio::join!(usm_output, acb_output);
-    let usm_output = usm_output?;
-    summary.generated_files.extend(usm_output.generated_files);
-    merge_raw_phase_ms(&mut summary.post_process_phase_ms, &usm_output.phase_ms);
-
-    let acb_output = acb_output.map_err(|source| ExportPipelineError::WorkerPanic {
+    })
+    .await
+    .map_err(|source| ExportPipelineError::WorkerPanic {
         worker: "acb post-process".to_string(),
         message: source.to_string(),
     })??;
@@ -560,7 +556,7 @@ pub(super) async fn process_usm_input_with_metrics(
         UsmProcessingInput::Bytes { .. } => None,
     };
 
-    if writes_mp4 && !writes_m2v {
+    if writes_mp4 && !writes_m2v && matches!(usm_input, UsmProcessingInput::Bytes { .. }) {
         let phase_started = Instant::now();
         let streams = export_usm_input_to_memory(usm_input, false)?;
         add_elapsed_phase_ms(
@@ -847,7 +843,7 @@ pub(super) fn handle_acb_files(
         return Ok(AcbPostProcessOutput::default());
     }
 
-    if acb_files.len() + acb_sources.len() == 1 || !options.region.export.hca.decode {
+    if !options.region.export.hca.decode {
         return handle_acb_files_batched(acb_files, acb_sources, options, acb_concurrency);
     }
     handle_acb_files_streaming(acb_files, acb_sources, options, acb_concurrency)
@@ -969,7 +965,7 @@ pub(super) fn handle_acb_files_streaming(
         let cpu_budget = options.cpu_budget;
         let handle = std::thread::Builder::new()
             .name("hca-memory-export".to_string())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(4 * 1024 * 1024)
             .spawn(move || loop {
                 if first_error.lock().unwrap().is_some() {
                     break;
@@ -1028,7 +1024,7 @@ pub(super) fn handle_acb_files_streaming(
         let cpu_budget = options.cpu_budget;
         let handle = std::thread::Builder::new()
             .name("acb-track-extract".to_string())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(4 * 1024 * 1024)
             .spawn(move || loop {
                 if first_error.lock().unwrap().is_some() {
                     break;
@@ -1381,7 +1377,7 @@ pub(super) fn process_hca_tracks(
         let cpu_budget = options.cpu_budget;
         let handle = std::thread::Builder::new()
             .name("hca-memory-export".to_string())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(4 * 1024 * 1024)
             .spawn(move || loop {
                 if first_error.lock().unwrap().is_some() {
                     break;
@@ -1455,7 +1451,7 @@ pub(super) fn process_hca_track_job_on_large_stack(
     let cpu_budget = options.cpu_budget;
     let handle = std::thread::Builder::new()
         .name("hca-memory-export".to_string())
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(4 * 1024 * 1024)
         .spawn(move || {
             let track_options = HcaTrackProcessOptions {
                 output_dir: &track.output_dir,

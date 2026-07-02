@@ -73,7 +73,7 @@ where
     let first_error = Arc::new(Mutex::new(None::<ExportPipelineError>));
     let task = Arc::new(task);
     let mut handles = Vec::with_capacity(worker_count);
-    const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+    const WORKER_STACK_SIZE: usize = 4 * 1024 * 1024;
 
     for _ in 0..worker_count {
         let queue = queue.clone();
@@ -151,6 +151,7 @@ type UsmSegmentGroupEntry = (usize, usize, PathBuf);
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum UsmProcessingInput {
     Path(PathBuf),
+    #[allow(dead_code)]
     Bytes {
         output_dir: PathBuf,
         output_name: String,
@@ -267,7 +268,7 @@ pub(super) fn prepare_usm_processing_inputs(
                     .into_iter()
                     .map(|(_, _, path)| path)
                     .collect::<Vec<_>>();
-                let merged = read_usm_segment_files_to_memory(&dir, &stem, &sources)?;
+                let merged = merge_usm_segment_files(&dir, &stem, &sources)?;
                 merged_count += sources.len();
                 prepared.push(merged);
                 continue;
@@ -315,31 +316,35 @@ pub(super) fn usm_segment_key(path: &Path) -> Option<(PathBuf, String, usize)> {
     ))
 }
 
-pub(super) fn read_usm_segment_files_to_memory(
+pub(super) fn merge_usm_segment_files(
     dir: &Path,
     stem: &str,
     usm_files: &[PathBuf],
 ) -> Result<UsmProcessingInput, ExportPipelineError> {
-    let mut data = Vec::new();
+    let merged_file = dir.join(format!("{stem}.usm"));
+    let mut target =
+        std::fs::File::create(&merged_file).map_err(|source| ExportPipelineError::Io {
+            path: merged_file.clone(),
+            source,
+        })?;
+
     for source_path in usm_files {
+        if source_path == &merged_file {
+            continue;
+        }
         let mut source =
             std::fs::File::open(source_path).map_err(|source| ExportPipelineError::Io {
                 path: source_path.clone(),
                 source,
             })?;
-        std::io::copy(&mut source, &mut data).map_err(|source| ExportPipelineError::Io {
+        std::io::copy(&mut source, &mut target).map_err(|source| ExportPipelineError::Io {
             path: source_path.clone(),
             source,
         })?;
+        remove_export_file_if_exists(source_path)?;
     }
 
-    Ok(UsmProcessingInput::Bytes {
-        output_dir: dir.to_path_buf(),
-        output_name: stem.to_string(),
-        fallback_name: format!("{stem}.usm"),
-        data,
-        source_files: usm_files.to_vec(),
-    })
+    Ok(UsmProcessingInput::Path(merged_file))
 }
 
 pub(super) fn merge_usm_inputs(

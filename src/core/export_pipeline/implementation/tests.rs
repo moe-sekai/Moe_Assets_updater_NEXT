@@ -156,25 +156,16 @@ fn prepare_usm_processing_inputs_merges_numbered_segments() {
     assert_eq!(prepared.files.len(), 1);
     assert_eq!(prepared.merged_count, 3);
     match &prepared.files[0] {
-        UsmProcessingInput::Bytes {
-            output_dir,
-            output_name,
-            fallback_name,
-            data,
-            source_files,
-        } => {
-            assert_eq!(output_dir, dir.path());
-            assert_eq!(output_name, "traffic_jam");
-            assert_eq!(fallback_name, "traffic_jam.usm");
-            assert_eq!(data, b"CRIDPAYLD");
-            assert_eq!(source_files, &vec![a.clone(), b.clone(), c.clone()]);
+        UsmProcessingInput::Path(path) => {
+            assert_eq!(path, &merged);
+            assert_eq!(fs::read(path).unwrap(), b"CRIDPAYLD");
         }
-        other => panic!("expected in-memory segmented USM input, got {other:?}"),
+        other => panic!("expected disk-backed segmented USM input, got {other:?}"),
     }
-    assert!(!merged.exists());
-    assert!(a.exists());
-    assert!(b.exists());
-    assert!(c.exists());
+    assert!(merged.exists());
+    assert!(!a.exists());
+    assert!(!b.exists());
+    assert!(!c.exists());
 }
 
 #[test]
@@ -196,22 +187,18 @@ fn prepare_usm_processing_inputs_merges_numbered_segments_with_duplicate_suffixe
 
     assert_eq!(prepared.files.len(), 1);
     assert_eq!(prepared.merged_count, 3);
+    let merged = dir.path().join("link_ppr_ed1.usm");
     match &prepared.files[0] {
-        UsmProcessingInput::Bytes {
-            output_dir,
-            output_name,
-            fallback_name,
-            data,
-            source_files,
-        } => {
-            assert_eq!(output_dir, dir.path());
-            assert_eq!(output_name, "link_ppr_ed1");
-            assert_eq!(fallback_name, "link_ppr_ed1.usm");
-            assert_eq!(data, b"CRIDCONTTAIL");
-            assert_eq!(source_files, &vec![a.clone(), b.clone(), c.clone()]);
+        UsmProcessingInput::Path(path) => {
+            assert_eq!(path, &merged);
+            assert_eq!(fs::read(path).unwrap(), b"CRIDCONTTAIL");
         }
-        other => panic!("expected in-memory segmented USM input, got {other:?}"),
+        other => panic!("expected disk-backed segmented USM input, got {other:?}"),
     }
+    assert!(merged.exists());
+    assert!(!a.exists());
+    assert!(!b.exists());
+    assert!(!c.exists());
 }
 
 #[test]
