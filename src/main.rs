@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use haruki_sekai_asset_updater::core::config::AppConfig;
 use haruki_sekai_asset_updater::service::http::{build_router, AppState};
 use haruki_sekai_asset_updater::service::logging::init_logging;
