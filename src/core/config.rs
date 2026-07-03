@@ -353,22 +353,18 @@ impl AppConfig {
                 parse_positive_usize("backends.asset_studio.read_batch_size", &value)?;
         }
         if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS") {
-            self.backends.asset_studio.worker_idle_timeout_seconds = parse_usize_env(
-                "backends.asset_studio.worker_idle_timeout_seconds",
-                &value,
-            )? as u64;
+            self.backends.asset_studio.worker_idle_timeout_seconds =
+                parse_usize_env("backends.asset_studio.worker_idle_timeout_seconds", &value)?
+                    as u64;
         }
         if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB") {
-            self.backends.asset_studio.worker_gc_heap_hard_limit_mb = parse_usize_env(
-                "backends.asset_studio.worker_gc_heap_hard_limit_mb",
-                &value,
-            )? as u64;
+            self.backends.asset_studio.worker_gc_heap_hard_limit_mb =
+                parse_usize_env("backends.asset_studio.worker_gc_heap_hard_limit_mb", &value)?
+                    as u64;
         }
         if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY") {
-            let parsed = parse_usize_env(
-                "backends.asset_studio.worker_gc_conserve_memory",
-                &value,
-            )?;
+            let parsed =
+                parse_usize_env("backends.asset_studio.worker_gc_conserve_memory", &value)?;
             if parsed > 9 {
                 return Err(ConfigError::InvalidValue {
                     field: "backends.asset_studio.worker_gc_conserve_memory".to_string(),
@@ -3208,7 +3204,10 @@ regions:
         let old_image_flush_bytes = std::env::var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES").ok();
 
         std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS", "45");
-        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB", "512");
+        std::env::set_var(
+            "HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB",
+            "512",
+        );
         std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY", "7");
         std::env::set_var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES", "1048576");
 
@@ -3216,10 +3215,7 @@ regions:
         writeln!(file, "config_version: 3").unwrap();
 
         let config = AppConfig::load_from_path(file.path()).unwrap();
-        assert_eq!(
-            config.backends.asset_studio.worker_idle_timeout_seconds,
-            45
-        );
+        assert_eq!(config.backends.asset_studio.worker_idle_timeout_seconds, 45);
         assert_eq!(
             config.backends.asset_studio.worker_gc_heap_hard_limit_mb,
             512

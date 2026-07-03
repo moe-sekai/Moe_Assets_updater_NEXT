@@ -21,7 +21,6 @@ hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 libc = "0.2"
 mime_guess = "2.0"
-tikv-jemallocator = "0.6"
 opendal = { version = "0.57.0", default-features = false, features = [
     "executors-tokio",
     "reqwest-rustls-tls",
@@ -59,3 +58,7 @@ media-ffi = ["dep:rsmpeg"]
 
 [profile.release]
 lto = "thin"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = "0.6"
+

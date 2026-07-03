@@ -265,7 +265,12 @@ impl AssetStudioWorkerPool {
         if self.tuning.gc_heap_hard_limit_mb > 0 {
             command.env(
                 "DOTNET_GCHeapHardLimit",
-                format!("{:x}", self.tuning.gc_heap_hard_limit_mb.saturating_mul(1024 * 1024)),
+                format!(
+                    "{:x}",
+                    self.tuning
+                        .gc_heap_hard_limit_mb
+                        .saturating_mul(1024 * 1024)
+                ),
             );
         }
         if let Some(conserve) = self.tuning.gc_conserve_memory {

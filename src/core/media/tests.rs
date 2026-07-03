@@ -13,6 +13,11 @@ use super::{
 use crate::core::config::MediaBackend;
 use crate::core::config::RetryConfig;
 
+#[cfg(not(target_os = "windows"))]
+const SCRIPT_EXT: &str = "sh";
+#[cfg(target_os = "windows")]
+const SCRIPT_EXT: &str = "bat";
+
 fn write_executable_script(path: &std::path::Path, script: impl AsRef<[u8]>) {
     let mut file = fs::File::create(path).unwrap();
     file.write_all(script.as_ref()).unwrap();
@@ -25,6 +30,101 @@ fn write_executable_script(path: &std::path::Path, script: impl AsRef<[u8]>) {
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+}
+
+fn get_fake_ffmpeg_script(input_log: Option<&str>) -> String {
+    if cfg!(target_os = "windows") {
+        if let Some(log_path) = input_log {
+            format!(
+                "@echo off\n\
+                 setlocal enabledelayedexpansion\n\
+                 set \"input=\"\n\
+                 set \"out=\"\n\
+                 set \"prev=\"\n\
+                 for %%a in (%*) do (\n\
+                   if \"!prev!\"==\"-i\" (\n\
+                     set \"input=%%~a\"\n\
+                   )\n\
+                   set \"out=%%~a\"\n\
+                   set \"prev=%%~a\"\n\
+                 )\n\
+                 <nul set /p=\"!input!\" > \"{}\"\n\
+                 copy /y nul \"!out!\" >nul\n",
+                log_path
+            )
+        } else {
+            "@echo off\n\
+             set \"out=\"\n\
+             for %%a in (%*) do (\n\
+               set \"out=%%~a\"\n\
+             )\n\
+             copy /y nul \"%out%\" >nul\n"
+                .to_string()
+        }
+    } else {
+        if let Some(log_path) = input_log {
+            format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 input=\"\"\n\
+                 out=\"\"\n\
+                 prev=\"\"\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$prev\" = \"-i\" ]; then input=\"$arg\"; fi\n\
+                   out=\"$arg\"\n\
+                   prev=\"$arg\"\n\
+                 done\n\
+                 printf '%s' \"$input\" > \"{}\"\n\
+                 : > \"$out\"\n",
+                log_path
+            )
+        } else {
+            "#!/bin/sh\n\
+             set -eu\n\
+             out=\"\"\n\
+             for arg in \"$@\"; do\n\
+               out=\"$arg\"\n\
+             done\n\
+             : > \"$out\"\n"
+                .to_string()
+        }
+    }
+}
+
+fn get_fake_ffmpeg_retry_script(marker_path: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!(
+            "@echo off\n\
+             if not exist \"{}\" (\n\
+               echo first > \"{}\"\n\
+               echo transient 1>&2\n\
+               exit /b 1\n\
+             )\n\
+             set \"out=\"\n\
+             for %%a in (%*) do (\n\
+               set \"out=%%~a\"\n\
+             )\n\
+             copy /y nul \"%out%\" >nul\n",
+            marker_path, marker_path
+        )
+    } else {
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             MARKER=\"{}\"\n\
+             if [ ! -f \"$MARKER\" ]; then\n\
+               echo first > \"$MARKER\"\n\
+               echo transient >&2\n\
+               exit 1\n\
+             fi\n\
+             out=\"\"\n\
+             for arg in \"$@\"; do\n\
+               out=\"$arg\"\n\
+             done\n\
+             : > \"$out\"\n",
+            marker_path
+        )
     }
 }
 
@@ -53,12 +153,9 @@ fn convert_usm_to_mp4_builds_ffmpeg_command() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("sample.usm");
     let output = dir.path().join("sample.mp4");
-    let script_path = dir.path().join("fake_ffmpeg.sh");
+    let script_path = dir.path().join(format!("fake_ffmpeg.{}", SCRIPT_EXT));
     fs::write(&input, b"dummy").unwrap();
-    write_executable_script(
-        &script_path,
-        "#!/bin/sh\nset -eu\nout=\"\"\nfor arg in \"$@\"; do\n  out=\"$arg\"\ndone\n: > \"$out\"\n",
-    );
+    write_executable_script(&script_path, get_fake_ffmpeg_script(None));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime
@@ -83,12 +180,9 @@ fn convert_m2v_to_mp4_removes_original_when_requested() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("sample.m2v");
     let output = dir.path().join("sample.mp4");
-    let script_path = dir.path().join("fake_ffmpeg.sh");
+    let script_path = dir.path().join(format!("fake_ffmpeg.{}", SCRIPT_EXT));
     fs::write(&input, b"dummy").unwrap();
-    write_executable_script(
-        &script_path,
-        "#!/bin/sh\nset -eu\nout=\"\"\nfor arg in \"$@\"; do\n  out=\"$arg\"\ndone\n: > \"$out\"\n",
-    );
+    write_executable_script(&script_path, get_fake_ffmpeg_script(None));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime
@@ -119,15 +213,12 @@ fn convert_usm_to_mp4_retries_after_command_failure() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("sample.usm");
     let output = dir.path().join("sample.mp4");
-    let script_path = dir.path().join("fake_ffmpeg_retry.sh");
+    let script_path = dir.path().join(format!("fake_ffmpeg_retry.{}", SCRIPT_EXT));
     let marker_path = dir.path().join("attempts.txt");
     fs::write(&input, b"dummy").unwrap();
     write_executable_script(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nMARKER=\"{}\"\nif [ ! -f \"$MARKER\" ]; then\n  echo first > \"$MARKER\"\n  echo transient >&2\n  exit 1\nfi\nout=\"\"\nfor arg in \"$@\"; do\n  out=\"$arg\"\ndone\n: > \"$out\"\n",
-            marker_path.display()
-        ),
+        get_fake_ffmpeg_retry_script(&marker_path.to_string_lossy()),
     );
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -154,12 +245,9 @@ fn auto_backend_falls_back_to_cli() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("sample.usm");
     let output = dir.path().join("sample.mp4");
-    let script_path = dir.path().join("fake_ffmpeg.sh");
+    let script_path = dir.path().join(format!("fake_ffmpeg.{}", SCRIPT_EXT));
     fs::write(&input, b"dummy").unwrap();
-    write_executable_script(
-        &script_path,
-        "#!/bin/sh\nset -eu\nout=\"\"\nfor arg in \"$@\"; do\n  out=\"$arg\"\ndone\n: > \"$out\"\n",
-    );
+    write_executable_script(&script_path, get_fake_ffmpeg_script(None));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime
@@ -219,24 +307,12 @@ fn cli_bytes_input_uses_system_temp_dir() {
     let output_dir = dir.path().join("exports");
     fs::create_dir_all(&output_dir).unwrap();
     let output = output_dir.join("sample.mp4");
-    let script_path = dir.path().join("fake_ffmpeg.sh");
+    let script_path = dir.path().join(format!("fake_ffmpeg.{}", SCRIPT_EXT));
     let input_log = dir.path().join("input_path.txt");
-    fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nset -eu\ninput=\"\"\nout=\"\"\nprev=\"\"\nfor arg in \"$@\"; do\n  if [ \"$prev\" = \"-i\" ]; then input=\"$arg\"; fi\n  out=\"$arg\"\n  prev=\"$arg\"\ndone\nprintf '%s' \"$input\" > \"{}\"\n: > \"$out\"\n",
-                input_log.display()
-            ),
-        )
-        .unwrap();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
-    }
+    write_executable_script(
+        &script_path,
+        get_fake_ffmpeg_script(Some(&input_log.to_string_lossy())),
+    );
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime

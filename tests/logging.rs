@@ -134,7 +134,7 @@ async fn binary_writes_main_and_access_logs_to_files() {
         .spawn()
         .unwrap();
 
-    if let Err(_) = wait_for_health(port).await {
+    if wait_for_health(port).await.is_err() {
         let _ = child.kill().await;
         let output = child.wait_with_output().await.unwrap();
         panic!(

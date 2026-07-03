@@ -2568,10 +2568,10 @@ mod tests {
     #[test]
     fn deobfuscate_matches_go_headers() {
         assert_eq!(
-            deobfuscate(&[0x20, 0x00, 0x00, 0x00, 1, 2, 3]),
+            deobfuscate(vec![0x20, 0x00, 0x00, 0x00, 1, 2, 3]),
             vec![1, 2, 3]
         );
-        assert_eq!(deobfuscate(&[9, 8, 7]), vec![9, 8, 7]);
+        assert_eq!(deobfuscate(vec![9, 8, 7]), vec![9, 8, 7]);
     }
 
     #[test]

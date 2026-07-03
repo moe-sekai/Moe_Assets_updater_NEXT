@@ -169,9 +169,7 @@ pub fn merge_snapshot(
 ) -> Result<(), AssetExecutionError> {
     let existing = load_snapshot(path)?;
     let mut merged = match existing {
-        Some(prev)
-            if prev.version.as_deref() == new_version && prev.os.as_deref() == new_os =>
-        {
+        Some(prev) if prev.version.as_deref() == new_version && prev.os.as_deref() == new_os => {
             prev
         }
         _ => AssetBundleInfo {

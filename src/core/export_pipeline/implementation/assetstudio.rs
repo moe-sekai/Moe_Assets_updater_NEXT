@@ -49,7 +49,10 @@ pub(super) async fn run_assetstudio_ffi_object_export(
             idle_timeout: Duration::from_secs(
                 app_config.backends.asset_studio.worker_idle_timeout_seconds,
             ),
-            gc_heap_hard_limit_mb: app_config.backends.asset_studio.worker_gc_heap_hard_limit_mb,
+            gc_heap_hard_limit_mb: app_config
+                .backends
+                .asset_studio
+                .worker_gc_heap_hard_limit_mb,
             gc_conserve_memory: app_config.backends.asset_studio.worker_gc_conserve_memory,
         },
     );
@@ -255,15 +258,12 @@ impl NativeObjectExportOptionsOwned {
             read_kinds: &self.read_kinds,
             image_format: &self.image_format,
             read_batch_size: self.read_batch_size,
-            image_flush: self
-                .image_flush
-                .as_ref()
-                .map(|flush| ImageFlushConfig {
-                    flush_bytes: flush.flush_bytes,
-                    concurrency: flush.concurrency,
-                    cpu_budget: flush.cpu_budget,
-                    image_backend: &flush.image_backend,
-                }),
+            image_flush: self.image_flush.as_ref().map(|flush| ImageFlushConfig {
+                flush_bytes: flush.flush_bytes,
+                concurrency: flush.concurrency,
+                cpu_budget: flush.cpu_budget,
+                image_backend: &flush.image_backend,
+            }),
         }
     }
 }

@@ -373,8 +373,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     // `progress` sends pile up in the unbounded mpsc which is fine because
     // each event is tiny (bundle path + few file paths).
     let uploader_setup = if ctx.config.hip.enabled {
-        let (artefact_tx, artefact_rx) =
-            tokio::sync::mpsc::channel::<BundleArtefacts>(32);
+        let (artefact_tx, artefact_rx) = tokio::sync::mpsc::channel::<BundleArtefacts>(32);
         let ctx_config = ctx.config.clone();
         let region_name = ctx.region_name.clone();
         let current_for_upload = current.clone();

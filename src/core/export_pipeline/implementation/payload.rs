@@ -153,7 +153,8 @@ pub(super) fn flush_queued_native_images_if_over_threshold(
     let Some(flush) = options.image_flush else {
         return Ok(());
     };
-    if path_state.pending_image_writes.is_empty() || path_state.pending_image_bytes < flush.flush_bytes
+    if path_state.pending_image_writes.is_empty()
+        || path_state.pending_image_bytes < flush.flush_bytes
     {
         return Ok(());
     }
@@ -173,8 +174,7 @@ pub(super) fn flush_queued_native_images_if_over_threshold(
         .or_default() += 1;
     debug!(
         flushed_images = flushed_count,
-        flushed_bytes,
-        "flushed queued native image reads mid-bundle to bound memory use"
+        flushed_bytes, "flushed queued native image reads mid-bundle to bound memory use"
     );
     Ok(())
 }
@@ -573,9 +573,7 @@ pub(super) fn queue_native_image_payload_final_files(
     region: &RegionConfig,
 ) -> Vec<PathBuf> {
     let written_files = planned_image_output_files(target, region);
-    path_state.pending_image_bytes = path_state
-        .pending_image_bytes
-        .saturating_add(payload.len());
+    path_state.pending_image_bytes = path_state.pending_image_bytes.saturating_add(payload.len());
     path_state
         .pending_image_writes
         .push(PendingNativeImageWrite {
