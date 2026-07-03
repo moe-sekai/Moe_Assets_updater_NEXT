@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,narenas:1,tcache:false,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 use haruki_sekai_asset_updater::core::config::AppConfig;
 use haruki_sekai_asset_updater::service::http::{build_router, AppState};
