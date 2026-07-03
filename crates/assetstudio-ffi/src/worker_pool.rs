@@ -298,7 +298,7 @@ impl AssetStudioWorkerPool {
 
         let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
         let spawned = self.stats.spawned.fetch_add(1, Ordering::Relaxed) + 1;
-        info!(
+        debug!(
             worker_id,
             pid = pid.unwrap_or_default(),
             spawned_workers = spawned,

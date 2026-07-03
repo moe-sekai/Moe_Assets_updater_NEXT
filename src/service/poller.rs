@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock, Semaphore};
@@ -408,8 +408,17 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     // Forwarder: bridges executor's unbounded progress channel → uploader's
     // bounded artefact channel. Runs concurrently with the executor.
     let artefact_tx_for_forwarder = uploader_setup.as_ref().map(|(tx, _)| tx.clone());
+    let region_name_for_progress = ctx.region_name.clone();
+    let layer1_skipped_for_progress = layer1_skipped_before_check;
+    let check_skipped_for_progress = check_skipped_counter.clone();
     let forwarder = tokio::spawn(async move {
+        let mut reporter = ProgressReporter::new(
+            region_name_for_progress,
+            layer1_skipped_for_progress,
+            check_skipped_for_progress,
+        );
         while let Some(event) = progress_rx.recv().await {
+            reporter.observe(&event);
             if let ExecutionProgressUpdate::BundleArtefactsProduced {
                 bundle,
                 bundle_hash,
@@ -436,6 +445,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
                 }
             }
         }
+        reporter.finish();
     });
 
     let summary = executor
@@ -942,6 +952,135 @@ async fn connect_hip(
         .await
         .map_err(|err| PollError::Hip(err.to_string()))?;
     Ok(Arc::new(session))
+}
+
+struct ProgressReporter {
+    region_name: String,
+    phase: String,
+    planned: usize,
+    started: usize,
+    downloaded: usize,
+    exported: usize,
+    artefacts_ready: usize,
+    completed: usize,
+    failed: usize,
+    layer1_skipped: u64,
+    hip_skipped: Arc<std::sync::atomic::AtomicU64>,
+    last_logged_at: Instant,
+    last_logged_percent_bucket: usize,
+}
+
+impl ProgressReporter {
+    const LOG_INTERVAL: Duration = Duration::from_secs(15);
+    const PERCENT_BUCKET: usize = 5;
+
+    fn new(
+        region_name: String,
+        layer1_skipped: u64,
+        hip_skipped: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            region_name,
+            phase: "starting".to_string(),
+            planned: 0,
+            started: 0,
+            downloaded: 0,
+            exported: 0,
+            artefacts_ready: 0,
+            completed: 0,
+            failed: 0,
+            layer1_skipped,
+            hip_skipped,
+            last_logged_at: Instant::now() - Self::LOG_INTERVAL,
+            last_logged_percent_bucket: 0,
+        }
+    }
+
+    fn observe(&mut self, event: &ExecutionProgressUpdate) {
+        let mut force = false;
+        match event {
+            ExecutionProgressUpdate::Phase { phase, .. } => {
+                self.phase = format!("{phase:?}");
+                force = true;
+            }
+            ExecutionProgressUpdate::DownloadsPlanned { total } => {
+                self.planned = *total;
+                force = true;
+            }
+            ExecutionProgressUpdate::BundleStarted { .. } => self.started += 1,
+            ExecutionProgressUpdate::BundleDownloaded { .. } => self.downloaded += 1,
+            ExecutionProgressUpdate::BundleExported { .. } => self.exported += 1,
+            ExecutionProgressUpdate::BundleArtefactsProduced { .. } => self.artefacts_ready += 1,
+            ExecutionProgressUpdate::BundleCompleted { .. } => {
+                self.completed += 1;
+                force = self.is_finished();
+            }
+            ExecutionProgressUpdate::BundleFailed { .. } => {
+                self.failed += 1;
+                force = true;
+            }
+            ExecutionProgressUpdate::RecordSaved { .. }
+            | ExecutionProgressUpdate::ChartHashSyncFinished { .. } => force = true,
+            ExecutionProgressUpdate::BundleFetchDetails { .. }
+            | ExecutionProgressUpdate::BundleDeobfuscated { .. }
+            | ExecutionProgressUpdate::BundleTempWritten { .. }
+            | ExecutionProgressUpdate::BundleFfiExportPhases { .. }
+            | ExecutionProgressUpdate::BundleFfiSkippedObjectReads { .. }
+            | ExecutionProgressUpdate::BundleFfiObjectReadPlan { .. }
+            | ExecutionProgressUpdate::SchedulerTelemetry { .. } => {}
+        }
+        self.maybe_log(force);
+    }
+
+    fn finish(&mut self) {
+        self.maybe_log(true);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.planned > 0 && self.completed + self.failed >= self.planned
+    }
+
+    fn percent_bucket(&self) -> usize {
+        if self.planned == 0 {
+            return 0;
+        }
+        let percent = ((self.completed + self.failed) * 100) / self.planned;
+        percent / Self::PERCENT_BUCKET
+    }
+
+    fn maybe_log(&mut self, force: bool) {
+        let bucket = self.percent_bucket();
+        let bucket_changed = bucket > self.last_logged_percent_bucket;
+        let interval_elapsed = self.last_logged_at.elapsed() >= Self::LOG_INTERVAL;
+        if !force && !bucket_changed && !interval_elapsed {
+            return;
+        }
+        self.last_logged_at = Instant::now();
+        self.last_logged_percent_bucket = bucket;
+        let processed = self.completed + self.failed;
+        let percent_x10 = if self.planned == 0 {
+            0
+        } else {
+            processed * 1000 / self.planned
+        };
+        info!(
+            region = %self.region_name,
+            phase = %self.phase,
+            planned = self.planned,
+            started = self.started,
+            downloaded = self.downloaded,
+            exported = self.exported,
+            artefacts_ready = self.artefacts_ready,
+            completed = self.completed,
+            failed = self.failed,
+            percent = %format_args!("{}.{:01}%", percent_x10 / 10, percent_x10 % 10),
+            skipped_layer1 = self.layer1_skipped,
+            skipped_hip = self
+                .hip_skipped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "asset execution progress"
+        );
+    }
 }
 
 struct CombinedFilter {
