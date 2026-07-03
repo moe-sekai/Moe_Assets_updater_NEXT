@@ -781,6 +781,12 @@ impl AssetExecutionContext {
                     Err(AssetExecutionError::Cancelled),
                 );
             }
+            let backlog_wait_started = Instant::now();
+            let backlog_permit = post_process_backlog_semaphore
+                .acquire_owned()
+                .await
+                .expect("post-process backlog semaphore closed");
+            let backlog_wait_ms = backlog_wait_started.elapsed().as_millis();
             let memory_wait_started = Instant::now();
             let mut memory_permit = memory_limiter.acquire(task.file_size.max(0) as usize).await;
             let memory_wait_ms = memory_wait_started.elapsed().as_millis();
@@ -802,12 +808,6 @@ impl AssetExecutionContext {
                 .await
             {
                 Ok(mut job) => {
-                    let backlog_wait_started = Instant::now();
-                    let backlog_permit = post_process_backlog_semaphore
-                        .acquire_owned()
-                        .await
-                        .expect("post-process backlog semaphore closed");
-                    let backlog_wait_ms = backlog_wait_started.elapsed().as_millis();
                     job.backlog_wait_ms = backlog_wait_ms;
                     job._backlog_permit = Some(backlog_permit);
                     job._memory_permit = memory_permit.take();
@@ -2308,7 +2308,7 @@ fn post_process_backlog_capacity(
     post_process_concurrency: usize,
 ) -> usize {
     let _ = download_concurrency;
-    post_process_concurrency.saturating_mul(2).max(1)
+    post_process_concurrency.max(1)
 }
 
 fn download_path_for_region(
@@ -2650,8 +2650,8 @@ mod tests {
     #[test]
     fn post_process_backlog_capacity_tracks_post_process_pressure() {
         assert_eq!(post_process_backlog_capacity(0, 0), 1);
-        assert_eq!(post_process_backlog_capacity(8, 2), 4);
-        assert_eq!(post_process_backlog_capacity(4, 12), 24);
+        assert_eq!(post_process_backlog_capacity(8, 2), 2);
+        assert_eq!(post_process_backlog_capacity(4, 12), 12);
     }
 
     #[test]

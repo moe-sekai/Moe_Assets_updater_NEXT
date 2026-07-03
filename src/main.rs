@@ -13,6 +13,7 @@ pub static malloc_conf: &[u8] =
 use haruki_sekai_asset_updater::core::config::AppConfig;
 use haruki_sekai_asset_updater::service::http::{build_router, AppState};
 use haruki_sekai_asset_updater::service::logging::init_logging;
+use haruki_sekai_asset_updater::service::memory_telemetry::spawn_memory_telemetry;
 use haruki_sekai_asset_updater::service::poller::Poller;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let cancel = CancellationToken::new();
+    spawn_memory_telemetry(cancel.clone());
     let poller = Poller::new(config.clone()).await?;
     let poller_handle = poller.handle();
 

@@ -282,6 +282,7 @@ impl AssetStudioWorkerPool {
                 program: worker_program.display().to_string(),
                 source,
             })?;
+        let pid = child.id();
         let stdin = child.stdin.take().ok_or_else(|| {
             AssetStudioFfiError::message(format!(
                 "failed to open stdin for native pooled worker `{}`",
@@ -297,15 +298,25 @@ impl AssetStudioWorkerPool {
 
         let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
         let spawned = self.stats.spawned.fetch_add(1, Ordering::Relaxed) + 1;
-        debug!(
+        info!(
             worker_id,
+            pid = pid.unwrap_or_default(),
             spawned_workers = spawned,
             process_concurrency = self.process_concurrency,
+            worker_max_calls = self.max_calls_per_worker,
+            worker_idle_timeout_secs = self.tuning.idle_timeout.as_secs(),
+            worker_gc_heap_hard_limit_mb = self.tuning.gc_heap_hard_limit_mb,
+            worker_gc_conserve_memory = self
+                .tuning
+                .gc_conserve_memory
+                .map(u64::from)
+                .unwrap_or_default(),
             "spawned assetstudio ffi worker"
         );
 
         Ok(PooledWorker {
             worker_id,
+            pid,
             program: self.worker_path.display().to_string(),
             child,
             stdin,
@@ -437,6 +448,7 @@ impl WorkerLease {
 
 struct PooledWorker {
     worker_id: u64,
+    pid: Option<u32>,
     program: String,
     child: Child,
     stdin: ChildStdin,
@@ -525,14 +537,16 @@ impl PooledWorker {
         self.completed_calls = self.completed_calls.saturating_add(1);
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         self.stats.record_call(elapsed_ms);
-        debug!(
+        info!(
             worker_id = self.worker_id,
+            pid = self.pid.unwrap_or_default(),
             request_id = id,
             operation = operation.as_str(),
             status,
             completed_calls = self.completed_calls,
             elapsed_ms,
-            payload_len = payload.len(),
+            payload_len = response.payload_len,
+            payload_in_memory_len = payload.len(),
             payload_file = payload_file
                 .as_ref()
                 .map(|path| path.display().to_string())
