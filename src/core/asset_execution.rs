@@ -331,6 +331,12 @@ enum BundleWorkOutput {
     NativePostProcess(Box<NativeBundlePostProcessJob>),
 }
 
+type BundleJoinOutput = (
+    String,
+    String,
+    Result<BundleWorkOutput, AssetExecutionError>,
+);
+
 impl AssetExecutionContext {
     pub fn new(
         app_config: &AppConfig,
@@ -480,6 +486,7 @@ impl AssetExecutionContext {
             });
         }
 
+        let queued_download_count = tasks.len();
         let mut completed = 0usize;
         let mut failed = 0usize;
         let mut pending_save_count = 0usize;
@@ -519,7 +526,7 @@ impl AssetExecutionContext {
         );
         tracing::info!(
             region = %self.region_name,
-            queued = tasks.len(),
+            queued = queued_download_count,
             download_concurrency,
             audio_encode_concurrency = concurrency.audio_encode,
             video_encode_concurrency = concurrency.video_encode,
@@ -528,82 +535,23 @@ impl AssetExecutionContext {
             "starting asset bundle processing"
         );
 
-        for task in tasks.clone() {
-            let ctx = self.clone();
-            let semaphore = semaphore.clone();
-            let memory_limiter = memory_limiter.clone();
-            let post_process_backlog_semaphore = post_process_backlog_semaphore.clone();
-            let app_config = app_config_cloned.clone();
-            let progress = progress.clone();
-            let cancel_flag = cancel_flag.clone();
-            let haruki_3d_work_root = haruki_3d_work_root.clone();
-            joins.spawn(async move {
-                let download_slot_wait_started = Instant::now();
-                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                let download_slot_wait_ms = download_slot_wait_started.elapsed().as_millis();
-                if cancel_flag
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::SeqCst))
-                {
-                    return (
-                        task.bundle_path.clone(),
-                        task.bundle_hash.clone(),
-                        Err(AssetExecutionError::Cancelled),
-                    );
-                }
-                let memory_wait_started = Instant::now();
-                let mut memory_permit =
-                    memory_limiter.acquire(task.file_size.max(0) as usize).await;
-                let memory_wait_ms = memory_wait_started.elapsed().as_millis();
-                Self::send_progress(
-                    &progress,
-                    ExecutionProgressUpdate::BundleStarted {
-                        bundle: task.bundle_path.clone(),
-                    },
-                );
-                let bundle_path = task.bundle_path.clone();
-                let bundle_hash = task.bundle_hash.clone();
-                let result = match ctx
-                    .download_and_export_bundle_payloads(
-                        &app_config,
-                        &task,
-                        &progress,
-                        haruki_3d_work_root.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(mut job) => {
-                        let backlog_wait_started = Instant::now();
-                        let backlog_permit = post_process_backlog_semaphore
-                            .acquire_owned()
-                            .await
-                            .expect("post-process backlog semaphore closed");
-                        let backlog_wait_ms = backlog_wait_started.elapsed().as_millis();
-                        job.backlog_wait_ms = backlog_wait_ms;
-                        job._backlog_permit = Some(backlog_permit);
-                        job._memory_permit = memory_permit.take();
-                        Ok(BundleWorkOutput::NativePostProcess(Box::new(job)))
-                    }
-                    Err(error) => Err(error),
-                };
-                let mut phase_ms = HashMap::new();
-                phase_ms.insert(
-                    "scheduler.download_slot_wait".to_string(),
-                    download_slot_wait_ms.min(u128::from(u64::MAX)) as u64,
-                );
-                phase_ms.insert(
-                    "scheduler.memory_wait".to_string(),
-                    memory_wait_ms.min(u128::from(u64::MAX)) as u64,
-                );
-                Self::send_progress(
-                    &progress,
-                    ExecutionProgressUpdate::SchedulerTelemetry {
-                        bundle: Some(task.bundle_path.clone()),
-                        phase_ms,
-                    },
-                );
-                (bundle_path, bundle_hash, result)
-            });
+        let mut pending_tasks = tasks.into_iter();
+        for _ in 0..download_concurrency {
+            let Some(task) = pending_tasks.next() else {
+                break;
+            };
+            Self::spawn_bundle_download_job(
+                &mut joins,
+                self.clone(),
+                task,
+                semaphore.clone(),
+                memory_limiter.clone(),
+                post_process_backlog_semaphore.clone(),
+                app_config_cloned.clone(),
+                progress.clone(),
+                cancel_flag.clone(),
+                haruki_3d_work_root.clone(),
+            );
         }
 
         while !joins.is_empty() || !post_process_joins.is_empty() {
@@ -697,6 +645,20 @@ impl AssetExecutionContext {
                             );
                         }
                     }
+                    if let Some(task) = pending_tasks.next() {
+                        Self::spawn_bundle_download_job(
+                            &mut joins,
+                            self.clone(),
+                            task,
+                            semaphore.clone(),
+                            memory_limiter.clone(),
+                            post_process_backlog_semaphore.clone(),
+                            app_config_cloned.clone(),
+                            progress.clone(),
+                            cancel_flag.clone(),
+                            haruki_3d_work_root.clone(),
+                        );
+                    }
                 }
                 Some(result) = post_process_joins.join_next(), if !post_process_joins.is_empty() => {
                     let (bundle_path, bundle_hash, result) =
@@ -784,12 +746,93 @@ impl AssetExecutionContext {
 
         Ok(ExecutionSummary {
             discovered_bundles: info.bundles.len(),
-            queued_downloads: tasks.len(),
+            queued_downloads: queued_download_count,
             completed_downloads: completed,
             failed_downloads: failed,
             updated_record_entries: downloaded_assets.len(),
             chart_hash_sync_performed,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_bundle_download_job(
+        joins: &mut JoinSet<BundleJoinOutput>,
+        ctx: AssetExecutionContext,
+        task: DownloadTask,
+        semaphore: Arc<Semaphore>,
+        memory_limiter: BundleMemoryLimiter,
+        post_process_backlog_semaphore: Arc<Semaphore>,
+        app_config: AppConfig,
+        progress: Option<UnboundedSender<ExecutionProgressUpdate>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        haruki_3d_work_root: Option<PathBuf>,
+    ) {
+        joins.spawn(async move {
+            let download_slot_wait_started = Instant::now();
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            let download_slot_wait_ms = download_slot_wait_started.elapsed().as_millis();
+            if cancel_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+            {
+                return (
+                    task.bundle_path.clone(),
+                    task.bundle_hash.clone(),
+                    Err(AssetExecutionError::Cancelled),
+                );
+            }
+            let memory_wait_started = Instant::now();
+            let mut memory_permit = memory_limiter.acquire(task.file_size.max(0) as usize).await;
+            let memory_wait_ms = memory_wait_started.elapsed().as_millis();
+            Self::send_progress(
+                &progress,
+                ExecutionProgressUpdate::BundleStarted {
+                    bundle: task.bundle_path.clone(),
+                },
+            );
+            let bundle_path = task.bundle_path.clone();
+            let bundle_hash = task.bundle_hash.clone();
+            let result = match ctx
+                .download_and_export_bundle_payloads(
+                    &app_config,
+                    &task,
+                    &progress,
+                    haruki_3d_work_root.as_deref(),
+                )
+                .await
+            {
+                Ok(mut job) => {
+                    let backlog_wait_started = Instant::now();
+                    let backlog_permit = post_process_backlog_semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("post-process backlog semaphore closed");
+                    let backlog_wait_ms = backlog_wait_started.elapsed().as_millis();
+                    job.backlog_wait_ms = backlog_wait_ms;
+                    job._backlog_permit = Some(backlog_permit);
+                    job._memory_permit = memory_permit.take();
+                    Ok(BundleWorkOutput::NativePostProcess(Box::new(job)))
+                }
+                Err(error) => Err(error),
+            };
+            let mut phase_ms = HashMap::new();
+            phase_ms.insert(
+                "scheduler.download_slot_wait".to_string(),
+                download_slot_wait_ms.min(u128::from(u64::MAX)) as u64,
+            );
+            phase_ms.insert(
+                "scheduler.memory_wait".to_string(),
+                memory_wait_ms.min(u128::from(u64::MAX)) as u64,
+            );
+            Self::send_progress(
+                &progress,
+                ExecutionProgressUpdate::SchedulerTelemetry {
+                    bundle: Some(task.bundle_path.clone()),
+                    phase_ms,
+                },
+            );
+            (bundle_path, bundle_hash, result)
+        });
     }
 
     pub async fn prefetch_asset_bundles(

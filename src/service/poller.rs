@@ -780,16 +780,42 @@ async fn flush_batch(
         "batch committed",
     );
 
-    if let Some(region_config) = config.regions.get(region_name) {
-        if region_config.upload.remove_local_after_upload {
-            for bundle in batch.iter() {
-                if succeeded_bundles.contains(&bundle.bundle_path) {
-                    for file in &bundle.files {
-                        let _ = tokio::fs::remove_file(file).await;
+    if config
+        .regions
+        .get(region_name)
+        .is_some_and(|region_config| region_config.upload.remove_local_after_upload)
+    {
+        let mut removed_files = 0usize;
+        let mut failed_files = 0usize;
+        for bundle in batch.iter() {
+            if !succeeded_bundles.contains(&bundle.bundle_path) {
+                continue;
+            }
+            for file in &bundle.files {
+                match tokio::fs::remove_file(file).await {
+                    Ok(()) => removed_files += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        failed_files += 1;
+                        warn!(
+                            region = %region_name,
+                            batch = batch_index,
+                            bundle = %bundle.bundle_path,
+                            path = %file.display(),
+                            error = %err,
+                            "failed to remove local artefact after HIP commit",
+                        );
                     }
                 }
             }
         }
+        info!(
+            region = %region_name,
+            batch = batch_index,
+            removed_files,
+            failed_files,
+            "removed local artefacts after HIP commit",
+        );
     }
 
     processed_all.extend(succeeded_bundles);
