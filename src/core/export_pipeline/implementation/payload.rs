@@ -132,6 +132,53 @@ pub(super) fn is_playable_mono_typetree(
         })
 }
 
+/// Called after each FFI read batch (and once more after playable-payload
+/// handling) while unpacking a single bundle. If `options.image_flush` is
+/// set and the images queued so far in `path_state` have crossed
+/// `flush_bytes`, encodes and writes them to disk immediately instead of
+/// letting them accumulate for the rest of the bundle.
+///
+/// Without this, a bundle containing many/large `Texture2D`/`Sprite`
+/// objects would buffer *all* of their raw, uncompressed RGBA payloads in
+/// memory (a single 4096x4096 texture alone is 64 MiB) until every object
+/// in the bundle had been read, regardless of how conservative the
+/// `concurrency.images` / `concurrency.download` settings were — those only
+/// bound the number of *bundles*/*encode workers* running concurrently, not
+/// how much decoded-but-not-yet-encoded data a single bundle can hold.
+pub(super) fn flush_queued_native_images_if_over_threshold(
+    options: &NativeObjectExportOptions<'_>,
+    path_state: &mut NativeSemanticExportPathState,
+    summary: &mut NativeObjectExportSummary,
+) -> Result<(), ExportPipelineError> {
+    let Some(flush) = options.image_flush else {
+        return Ok(());
+    };
+    if path_state.pending_image_writes.is_empty() || path_state.pending_image_bytes < flush.flush_bytes
+    {
+        return Ok(());
+    }
+    let pending = std::mem::take(&mut path_state.pending_image_writes);
+    let flushed_bytes = std::mem::take(&mut path_state.pending_image_bytes);
+    let flushed_count = pending.len();
+    let phase_ms = flush_pending_native_image_writes_with(
+        pending,
+        flush.concurrency,
+        flush.cpu_budget,
+        flush.image_backend,
+    )?;
+    merge_raw_phase_ms(&mut summary.phase_ms, &phase_ms);
+    *summary
+        .phase_ms
+        .entry("image_encode.mid_bundle_flushes".to_string())
+        .or_default() += 1;
+    debug!(
+        flushed_images = flushed_count,
+        flushed_bytes,
+        "flushed queued native image reads mid-bundle to bound memory use"
+    );
+    Ok(())
+}
+
 pub(super) fn write_assetstudio_playable_payloads(
     options: &NativeObjectExportOptions<'_>,
     path_state: &mut NativeSemanticExportPathState,
@@ -526,6 +573,9 @@ pub(super) fn queue_native_image_payload_final_files(
     region: &RegionConfig,
 ) -> Vec<PathBuf> {
     let written_files = planned_image_output_files(target, region);
+    path_state.pending_image_bytes = path_state
+        .pending_image_bytes
+        .saturating_add(payload.len());
     path_state
         .pending_image_writes
         .push(PendingNativeImageWrite {
@@ -588,15 +638,35 @@ pub(crate) fn flush_pending_native_image_writes(
     app_config: &AppConfig,
     pending: Vec<PendingNativeImageWrite>,
 ) -> Result<HashMap<String, u64>, ExportPipelineError> {
+    let image_concurrency = app_config.effective_concurrency().images;
+    let cpu_budget = app_config.effective_cpu_budget();
+    flush_pending_native_image_writes_with(
+        pending,
+        image_concurrency,
+        cpu_budget,
+        &app_config.backends.image,
+    )
+}
+
+/// Encodes and writes every queued `PendingNativeImageWrite` to disk,
+/// freeing their buffered payload bytes. Shared by the end-of-bundle flush
+/// (`flush_pending_native_image_writes`, used when `image_flush_bytes` is
+/// disabled or as the final flush of any remainder) and the mid-bundle
+/// flush triggered from the FFI object-read loop once queued bytes cross
+/// `AssetStudioBackendConfig::image_flush_bytes`.
+pub(super) fn flush_pending_native_image_writes_with(
+    pending: Vec<PendingNativeImageWrite>,
+    image_concurrency: usize,
+    cpu_budget: usize,
+    image_backend: &ImageBackendConfig,
+) -> Result<HashMap<String, u64>, ExportPipelineError> {
     let mut phase_ms = HashMap::new();
     let image_count = pending.len();
     if image_count == 0 {
         return Ok(phase_ms);
     }
 
-    let image_concurrency = app_config.effective_concurrency().images;
-    let cpu_budget = app_config.effective_cpu_budget();
-    let image_backend = app_config.backends.image.clone();
+    let image_backend = image_backend.clone();
     let mut format_counts: HashMap<ImageOutputFormat, u64> = HashMap::new();
     for job in &pending {
         for format in job.region.export.images.output_formats() {

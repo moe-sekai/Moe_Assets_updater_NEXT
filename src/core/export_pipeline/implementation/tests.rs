@@ -23,10 +23,10 @@ use super::{
     assetstudio_export_type_selector, assetstudio_fix_file_name,
     assetstudio_object_mode_supported_type, assetstudio_type_selector_matches,
     convert_native_surrogate_images_to_png, extract_unity_asset_bundle,
-    flush_pending_native_image_writes, get_export_group, handle_png_conversion,
-    native_object_output_extension, native_object_output_path, native_read_batch_size_for_assets,
-    native_read_kind_for_asset, native_skipped_unsupported_asset,
-    parse_assetstudio_ffi_context_list_objects_worker_output,
+    flush_pending_native_image_writes, flush_queued_native_images_if_over_threshold,
+    get_export_group, handle_png_conversion, native_object_output_extension,
+    native_object_output_path, native_read_batch_size_for_assets, native_read_kind_for_asset,
+    native_skipped_unsupported_asset, parse_assetstudio_ffi_context_list_objects_worker_output,
     parse_assetstudio_ffi_object_read_batch_worker_output_recoverable,
     parse_assetstudio_ffi_object_read_worker_output_recoverable, parse_payload_bundle,
     parse_payload_bundle_borrowed, playable_container_output_path, post_process_exported_files,
@@ -37,7 +37,7 @@ use super::{
     usm_segment_key, write_assetstudio_export_manifest_entry,
     write_native_image_payload_final_files, write_native_image_payload_final_files_with_backend,
     write_native_object_payload, AssetStudioFfiAssetInfo, AssetStudioFfiObjectReadOutput,
-    AssetStudioFfiObjectReadResponse, AssetStudioFfiResponse, MediaEncodeKind,
+    AssetStudioFfiObjectReadResponse, AssetStudioFfiResponse, ImageFlushConfig, MediaEncodeKind,
     NativeBatchPhaseStats, NativeObjectExportOptions, NativeObjectExportSummary,
     NativeObjectReadBatchParseOutput, NativeObjectReadParseResult, NativeObjectReadPlanStats,
     NativeSemanticExportPathState, UsmProcessingInput, WorkerOutput,
@@ -802,6 +802,7 @@ fn native_image_object_payload_is_flushed_after_export_queue() {
         read_kinds: &read_kinds,
         image_format: "raw_rgba",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -854,6 +855,157 @@ fn native_image_object_payload_is_flushed_after_export_queue() {
 }
 
 #[test]
+fn mid_bundle_image_flush_writes_and_clears_queue_once_threshold_crossed() {
+    let dir = tempdir().unwrap();
+    let (_config, region) = processing_config();
+    let read_kinds = BTreeMap::new();
+    let image_backend = ImageBackendConfig::default();
+    let payload = make_native_rgba_ir_payload(
+        2,
+        2,
+        &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 7, 8, 9, 255],
+    );
+    let payload_len = payload.len();
+    // Threshold is smaller than a single queued payload, so the very next
+    // asset queued after it should trigger an immediate flush.
+    let options = NativeObjectExportOptions {
+        output_dir: dir.path(),
+        export_path: "character/member/test",
+        strip_path_prefix: "assets/sekai/assetbundle/resources",
+        region: &region,
+        read_kinds: &read_kinds,
+        image_format: "raw_rgba",
+        read_batch_size: 16,
+        image_flush: Some(ImageFlushConfig {
+            flush_bytes: payload_len,
+            concurrency: 1,
+            cpu_budget: 1,
+            image_backend: &image_backend,
+        }),
+    };
+    let mut path_state = NativeSemanticExportPathState::default();
+    let mut summary = NativeObjectExportSummary::default();
+
+    let asset = AssetStudioFfiAssetInfo {
+        index: 0,
+        name: Some("normal".to_string()),
+        container: Some(
+            "assets/sekai/assetbundle/resources/startapp/character/member/test/normal.png"
+                .to_string(),
+        ),
+        asset_type: Some("Texture2D".to_string()),
+        type_id: 28,
+        path_id: 123,
+        unique_id: None,
+        size: 16,
+        source_file: None,
+    };
+    let read_output = AssetStudioFfiObjectReadOutput {
+        response: AssetStudioFfiObjectReadResponse {
+            success: true,
+            asset: Some(asset.clone()),
+            payload_kind: Some("image_raw_rgba".to_string()),
+            payload_len: payload_len as i64,
+            suggested_extension: Some(".png".to_string()),
+            warnings: Vec::new(),
+            phase_ms: HashMap::new(),
+            error: None,
+            duration_ms: None,
+        },
+        payload,
+    };
+
+    write_native_object_payload(&options, &mut path_state, &asset, &read_output).unwrap();
+    assert_eq!(path_state.pending_image_writes.len(), 1);
+    assert!(path_state.pending_image_bytes >= payload_len);
+
+    let expected = dir.path().join("character/member/test/normal.png");
+    assert!(!expected.exists());
+
+    flush_queued_native_images_if_over_threshold(&options, &mut path_state, &mut summary).unwrap();
+
+    // The queue and its byte counter should be drained by the flush, and
+    // the encoded file should now exist on disk instead of sitting in
+    // memory for the rest of the bundle.
+    assert!(path_state.pending_image_writes.is_empty());
+    assert_eq!(path_state.pending_image_bytes, 0);
+    assert!(expected.exists());
+    assert_eq!(
+        summary.phase_ms.get("image_encode.mid_bundle_flushes"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn mid_bundle_image_flush_is_noop_below_threshold() {
+    let dir = tempdir().unwrap();
+    let (_config, region) = processing_config();
+    let read_kinds = BTreeMap::new();
+    let image_backend = ImageBackendConfig::default();
+    let options = NativeObjectExportOptions {
+        output_dir: dir.path(),
+        export_path: "character/member/test",
+        strip_path_prefix: "assets/sekai/assetbundle/resources",
+        region: &region,
+        read_kinds: &read_kinds,
+        image_format: "raw_rgba",
+        read_batch_size: 16,
+        // Effectively unreachable threshold: nothing queued should ever
+        // trigger a flush.
+        image_flush: Some(ImageFlushConfig {
+            flush_bytes: usize::MAX,
+            concurrency: 1,
+            cpu_budget: 1,
+            image_backend: &image_backend,
+        }),
+    };
+    let mut path_state = NativeSemanticExportPathState::default();
+    let mut summary = NativeObjectExportSummary::default();
+
+    let asset = AssetStudioFfiAssetInfo {
+        index: 0,
+        name: Some("normal".to_string()),
+        container: Some(
+            "assets/sekai/assetbundle/resources/startapp/character/member/test/normal.png"
+                .to_string(),
+        ),
+        asset_type: Some("Texture2D".to_string()),
+        type_id: 28,
+        path_id: 123,
+        unique_id: None,
+        size: 16,
+        source_file: None,
+    };
+    let payload = make_native_rgba_ir_payload(
+        2,
+        2,
+        &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 7, 8, 9, 255],
+    );
+    let read_output = AssetStudioFfiObjectReadOutput {
+        response: AssetStudioFfiObjectReadResponse {
+            success: true,
+            asset: Some(asset.clone()),
+            payload_kind: Some("image_raw_rgba".to_string()),
+            payload_len: payload.len() as i64,
+            suggested_extension: Some(".png".to_string()),
+            warnings: Vec::new(),
+            phase_ms: HashMap::new(),
+            error: None,
+            duration_ms: None,
+        },
+        payload,
+    };
+    write_native_object_payload(&options, &mut path_state, &asset, &read_output).unwrap();
+
+    flush_queued_native_images_if_over_threshold(&options, &mut path_state, &mut summary).unwrap();
+
+    assert_eq!(path_state.pending_image_writes.len(), 1);
+    assert!(!summary
+        .phase_ms
+        .contains_key("image_encode.mid_bundle_flushes"));
+}
+
+#[test]
 fn text_asset_acb_payload_is_queued_as_memory_source_without_writing_file() {
     let dir = tempdir().unwrap();
     let (_config, mut region) = processing_config();
@@ -867,6 +1019,7 @@ fn text_asset_acb_payload_is_queued_as_memory_source_without_writing_file() {
         read_kinds: &read_kinds,
         image_format: "bmp",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -926,6 +1079,7 @@ fn music_score_text_asset_manifest_uses_public_txt_extension() {
         read_kinds: &read_kinds,
         image_format: "raw_rgba",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -994,6 +1148,7 @@ fn decoded_usm_text_asset_is_not_recorded_as_final_manifest_entry() {
         read_kinds: &read_kinds,
         image_format: "raw_rgba",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -1051,6 +1206,7 @@ fn assetbundle_typetree_routes_to_container_bundle_record_path() {
         read_kinds: &read_kinds,
         image_format: "bmp",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -1117,6 +1273,7 @@ fn assetbundle_typetree_mixed_categories_use_stable_bundle_fallback_path() {
         read_kinds: &read_kinds,
         image_format: "bmp",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -1188,6 +1345,7 @@ fn monoscript_typetree_routes_to_container_subasset_path() {
         read_kinds: &read_kinds,
         image_format: "bmp",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -1986,6 +2144,7 @@ fn native_object_export_skips_byte_identical_semantic_duplicates() {
         read_kinds: &read_kinds,
         image_format: "raw_rgba",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {
@@ -2048,6 +2207,7 @@ fn native_object_export_keeps_distinct_semantic_duplicates() {
         read_kinds: &read_kinds,
         image_format: "raw_rgba",
         read_batch_size: 16,
+        image_flush: None,
     };
     let mut path_state = NativeSemanticExportPathState::default();
     let asset = AssetStudioFfiAssetInfo {

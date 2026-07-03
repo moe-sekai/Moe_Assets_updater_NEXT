@@ -264,6 +264,15 @@ impl AppConfig {
         if let Some(image_format) = &self.backends.asset_studio.image_format {
             validate_asset_studio_ffi_image_format(image_format)?;
         }
+        if let Some(conserve) = self.backends.asset_studio.worker_gc_conserve_memory {
+            if conserve > 9 {
+                return Err(ConfigError::InvalidValue {
+                    field: "backends.asset_studio.worker_gc_conserve_memory".to_string(),
+                    value: conserve.to_string(),
+                    expected: "an integer from 0 to 9".to_string(),
+                });
+            }
+        }
         validate_image_backend(&self.backends.image)?;
         for (region_name, region) in &self.regions {
             validate_image_export_config(region_name, &region.export.images)?;
@@ -342,6 +351,36 @@ impl AppConfig {
         if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_READ_BATCH_SIZE") {
             self.backends.asset_studio.read_batch_size =
                 parse_positive_usize("backends.asset_studio.read_batch_size", &value)?;
+        }
+        if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS") {
+            self.backends.asset_studio.worker_idle_timeout_seconds = parse_usize_env(
+                "backends.asset_studio.worker_idle_timeout_seconds",
+                &value,
+            )? as u64;
+        }
+        if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB") {
+            self.backends.asset_studio.worker_gc_heap_hard_limit_mb = parse_usize_env(
+                "backends.asset_studio.worker_gc_heap_hard_limit_mb",
+                &value,
+            )? as u64;
+        }
+        if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY") {
+            let parsed = parse_usize_env(
+                "backends.asset_studio.worker_gc_conserve_memory",
+                &value,
+            )?;
+            if parsed > 9 {
+                return Err(ConfigError::InvalidValue {
+                    field: "backends.asset_studio.worker_gc_conserve_memory".to_string(),
+                    value: value.clone(),
+                    expected: "an integer from 0 to 9".to_string(),
+                });
+            }
+            self.backends.asset_studio.worker_gc_conserve_memory = Some(parsed as u8);
+        }
+        if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES") {
+            self.backends.asset_studio.image_flush_bytes =
+                parse_usize_env("backends.asset_studio.image_flush_bytes", &value)?;
         }
         if let Ok(value) = env::var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FORMAT") {
             self.backends.asset_studio.image_format =
@@ -1144,6 +1183,38 @@ pub struct AssetStudioBackendConfig {
     pub read_batch_size: usize,
     pub image_format: Option<String>,
     pub read_kinds: BTreeMap<String, String>,
+    /// Kill a pooled FFI worker process (a standalone .NET NativeAOT
+    /// process) after it has sat idle in the pool for this many seconds.
+    /// `0` disables idle reaping (workers only recycle via
+    /// `worker_max_calls`, same as before this option existed). Idle
+    /// workers otherwise stay resident and keep whatever memory their GC
+    /// has committed, so under bursty load `process_concurrency` workers
+    /// can end up permanently resident even once traffic drops off.
+    pub worker_idle_timeout_seconds: u64,
+    /// Per-worker `DOTNET_GCHeapHardLimit`, in megabytes. `0` leaves the
+    /// .NET default untouched (which sizes itself against the *whole*
+    /// container's memory — a problem once more than one worker process
+    /// runs concurrently, since every worker makes that same assumption
+    /// independently). A reasonable starting point is a few hundred MB per
+    /// worker, sized so `process_concurrency * worker_gc_heap_hard_limit_mb`
+    /// stays comfortably under the container's memory limit.
+    pub worker_gc_heap_hard_limit_mb: u64,
+    /// `DOTNET_GCConserveMemory` for each spawned worker (0-9; higher trades
+    /// GC/allocation throughput for returning memory to the OS more
+    /// aggressively). `None`/absent leaves the .NET default untouched.
+    pub worker_gc_conserve_memory: Option<u8>,
+    /// Soft memory guard for queued-but-not-yet-encoded texture reads.
+    /// Decoded `Texture2D`/`Sprite` payloads are read as raw, uncompressed
+    /// RGBA (see `image_format`) and buffered in memory until they're
+    /// encoded to PNG/JPG/WebP; a single 4096x4096 texture is 64 MiB
+    /// uncompressed, and bundles with dozens of textures used to buffer
+    /// *all* of them before encoding a single one. Once the buffered bytes
+    /// for the bundle currently being read cross this threshold, the queue
+    /// is flushed (encoded + written to disk, freeing the buffered bytes)
+    /// before continuing to read more objects from the bundle. `0` disables
+    /// the mid-bundle flush and restores the old "flush once, at the end of
+    /// the bundle" behaviour.
+    pub image_flush_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1390,6 +1461,20 @@ impl Default for AssetStudioBackendConfig {
             read_batch_size: 64,
             image_format: None,
             read_kinds: BTreeMap::new(),
+            // Reap workers idle for >2 minutes by default. Previously idle
+            // pooled workers never exited on their own (only
+            // `worker_max_calls` recycling touched them), so under bursty
+            // traffic `process_concurrency` .NET worker processes could
+            // stay resident — and keep whatever memory their GC had
+            // committed — indefinitely after the burst ended.
+            worker_idle_timeout_seconds: 120,
+            worker_gc_heap_hard_limit_mb: 0,
+            worker_gc_conserve_memory: None,
+            // Flush every ~128 MiB of buffered raw-RGBA texture reads
+            // instead of waiting for the whole bundle to finish reading.
+            // Keeps a bundle with many/large textures from parking all of
+            // them, uncompressed, in memory simultaneously.
+            image_flush_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -2161,6 +2246,39 @@ asset_studio:
             asset_studio.read_kinds.get("all").map(String::as_str),
             Some("typetree_json")
         );
+    }
+
+    #[test]
+    fn asset_studio_memory_tuning_defaults_are_conservative() {
+        let config = AssetStudioBackendConfig::default();
+        // Idle pooled workers (standalone .NET processes) should eventually
+        // get reaped instead of staying resident forever.
+        assert_eq!(config.worker_idle_timeout_seconds, 120);
+        // No hard GC cap out of the box (opt-in, since it needs sizing
+        // against `process_concurrency` and the host's memory limit).
+        assert_eq!(config.worker_gc_heap_hard_limit_mb, 0);
+        assert_eq!(config.worker_gc_conserve_memory, None);
+        // Mid-bundle image flush is on by default so a single bundle with
+        // many/large textures can't buffer all of them, uncompressed, at
+        // once.
+        assert_eq!(config.image_flush_bytes, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_asset_studio_memory_tuning_options() {
+        let yaml = r#"
+asset_studio:
+  worker_idle_timeout_seconds: 30
+  worker_gc_heap_hard_limit_mb: 256
+  worker_gc_conserve_memory: 5
+  image_flush_bytes: 67108864
+"#;
+        let backends: BackendsConfig = yaml_serde::from_str(yaml).unwrap();
+        let asset_studio = &backends.asset_studio;
+        assert_eq!(asset_studio.worker_idle_timeout_seconds, 30);
+        assert_eq!(asset_studio.worker_gc_heap_hard_limit_mb, 256);
+        assert_eq!(asset_studio.worker_gc_conserve_memory, Some(5));
+        assert_eq!(asset_studio.image_flush_bytes, 67108864);
     }
 
     #[test]
@@ -3027,6 +3145,18 @@ regions:
     }
 
     #[test]
+    fn rejects_out_of_range_worker_gc_conserve_memory() {
+        let mut config = AppConfig::default();
+        config.backends.asset_studio.worker_gc_conserve_memory = Some(10);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { ref field, .. }
+                if field == "backends.asset_studio.worker_gc_conserve_memory"
+        ));
+    }
+
+    #[test]
     fn load_from_path_errors_when_secret_env_reference_is_missing() {
         std::env::remove_var("HARUKI_TEST_MISSING_AES_KEY");
         let mut file = NamedTempFile::new().unwrap();
@@ -3064,5 +3194,79 @@ regions:
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
         }
+    }
+
+    #[test]
+    fn load_from_path_applies_asset_studio_memory_tuning_env_overrides() {
+        let _env_lock = env_lock();
+        let old_idle_timeout =
+            std::env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS").ok();
+        let old_gc_heap_hard_limit_mb =
+            std::env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB").ok();
+        let old_gc_conserve_memory =
+            std::env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY").ok();
+        let old_image_flush_bytes = std::env::var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES").ok();
+
+        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS", "45");
+        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB", "512");
+        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY", "7");
+        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES", "1048576");
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "config_version: 3").unwrap();
+
+        let config = AppConfig::load_from_path(file.path()).unwrap();
+        assert_eq!(
+            config.backends.asset_studio.worker_idle_timeout_seconds,
+            45
+        );
+        assert_eq!(
+            config.backends.asset_studio.worker_gc_heap_hard_limit_mb,
+            512
+        );
+        assert_eq!(
+            config.backends.asset_studio.worker_gc_conserve_memory,
+            Some(7)
+        );
+        assert_eq!(config.backends.asset_studio.image_flush_bytes, 1_048_576);
+
+        restore_env(
+            "HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS",
+            old_idle_timeout,
+        );
+        restore_env(
+            "HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB",
+            old_gc_heap_hard_limit_mb,
+        );
+        restore_env(
+            "HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY",
+            old_gc_conserve_memory,
+        );
+        restore_env(
+            "HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES",
+            old_image_flush_bytes,
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_worker_gc_conserve_memory_env_override() {
+        let _env_lock = env_lock();
+        let old_gc_conserve_memory =
+            std::env::var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY").ok();
+        std::env::set_var("HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY", "42");
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "config_version: 3").unwrap();
+        let err = AppConfig::load_from_path(file.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { ref field, .. }
+                if field == "backends.asset_studio.worker_gc_conserve_memory"
+        ));
+
+        restore_env(
+            "HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY",
+            old_gc_conserve_memory,
+        );
     }
 }

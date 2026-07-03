@@ -4,6 +4,18 @@ pub(super) fn configured_path(path: Option<&str>) -> Option<&str> {
     path.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn image_flush_config(app_config: &AppConfig) -> Option<ImageFlushConfig<'_>> {
+    if app_config.backends.asset_studio.image_flush_bytes == 0 {
+        return None;
+    }
+    Some(ImageFlushConfig {
+        flush_bytes: app_config.backends.asset_studio.image_flush_bytes,
+        concurrency: app_config.effective_concurrency().images,
+        cpu_budget: app_config.effective_cpu_budget(),
+        image_backend: &app_config.backends.image,
+    })
+}
+
 pub(super) async fn run_assetstudio_ffi_object_export(
     app_config: &AppConfig,
     region: &RegionConfig,
@@ -28,11 +40,18 @@ pub(super) async fn run_assetstudio_ffi_object_export(
 
     let worker_path =
         configured_worker_path(app_config.backends.asset_studio.worker_path.as_deref())?;
-    let pool = AssetStudioWorkerPool::shared(
+    let pool = AssetStudioWorkerPool::shared_with_tuning(
         &worker_path,
         native_library_path,
         app_config.effective_asset_studio_ffi_process_concurrency(),
         app_config.backends.asset_studio.worker_max_calls,
+        WorkerPoolTuning {
+            idle_timeout: Duration::from_secs(
+                app_config.backends.asset_studio.worker_idle_timeout_seconds,
+            ),
+            gc_heap_hard_limit_mb: app_config.backends.asset_studio.worker_gc_heap_hard_limit_mb,
+            gc_conserve_memory: app_config.backends.asset_studio.worker_gc_conserve_memory,
+        },
     );
     let open_request = AssetStudioFfiContextOpenRequest {
         input_path: asset_bundle_file.to_string_lossy().to_string(),
@@ -60,6 +79,7 @@ pub(super) async fn run_assetstudio_ffi_object_export(
             .as_deref()
             .unwrap_or(NATIVE_AOT_DEFAULT_IMAGE_FORMAT),
         read_batch_size: app_config.backends.asset_studio.read_batch_size,
+        image_flush: image_flush_config(app_config),
     };
     let result = call_assetstudio_ffi_object_export_pooled(
         &pool,
@@ -129,6 +149,7 @@ async fn call_assetstudio_ffi_object_export_direct(
             .as_deref()
             .unwrap_or(NATIVE_AOT_DEFAULT_IMAGE_FORMAT),
         read_batch_size: app_config.backends.asset_studio.read_batch_size,
+        image_flush: image_flush_config(app_config),
     };
     let wait_ms = wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let native_library_path = native_library_path.to_string();
@@ -195,6 +216,15 @@ struct NativeObjectExportOptionsOwned {
     read_kinds: BTreeMap<String, String>,
     image_format: String,
     read_batch_size: usize,
+    image_flush: Option<ImageFlushConfigOwned>,
+}
+
+#[derive(Clone)]
+struct ImageFlushConfigOwned {
+    flush_bytes: usize,
+    concurrency: usize,
+    cpu_budget: usize,
+    image_backend: ImageBackendConfig,
 }
 
 impl NativeObjectExportOptionsOwned {
@@ -207,6 +237,12 @@ impl NativeObjectExportOptionsOwned {
             read_kinds: options.read_kinds.clone(),
             image_format: options.image_format.to_string(),
             read_batch_size: options.read_batch_size,
+            image_flush: options.image_flush.map(|flush| ImageFlushConfigOwned {
+                flush_bytes: flush.flush_bytes,
+                concurrency: flush.concurrency,
+                cpu_budget: flush.cpu_budget,
+                image_backend: flush.image_backend.clone(),
+            }),
         }
     }
 
@@ -219,6 +255,15 @@ impl NativeObjectExportOptionsOwned {
             read_kinds: &self.read_kinds,
             image_format: &self.image_format,
             read_batch_size: self.read_batch_size,
+            image_flush: self
+                .image_flush
+                .as_ref()
+                .map(|flush| ImageFlushConfig {
+                    flush_bytes: flush.flush_bytes,
+                    concurrency: flush.concurrency,
+                    cpu_budget: flush.cpu_budget,
+                    image_backend: &flush.image_backend,
+                }),
         }
     }
 }
@@ -281,6 +326,10 @@ pub(super) fn record_worker_lease_stats(
     phase_ms.insert("worker_pool.spawned".to_string(), stats.pool.spawned);
     phase_ms.insert("worker_pool.recycled".to_string(), stats.pool.recycled);
     phase_ms.insert("worker_pool.killed".to_string(), stats.pool.killed);
+    phase_ms.insert(
+        "worker_pool.idle_reaped".to_string(),
+        stats.pool.idle_reaped,
+    );
     phase_ms.insert(
         "worker_pool.protocol_errors".to_string(),
         stats.pool.protocol_errors,
@@ -454,8 +503,10 @@ where
                     }
                 }
             }
+            flush_queued_native_images_if_over_threshold(options, &mut path_state, &mut summary)?;
         }
         write_assetstudio_playable_payloads(options, &mut path_state, playable_outputs)?;
+        flush_queued_native_images_if_over_threshold(options, &mut path_state, &mut summary)?;
         summary.written_files = path_state.written_files;
         summary.acb_sources = path_state.acb_sources;
         summary.pending_image_writes = path_state.pending_image_writes;

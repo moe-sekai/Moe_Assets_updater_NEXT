@@ -52,6 +52,10 @@
   `HARUKI_ASSET_STUDIO_FFI_WORKER_MAX_CALLS`,
   `HARUKI_ASSET_STUDIO_FFI_READ_BATCH_SIZE`,
   `HARUKI_ASSET_STUDIO_FFI_IMAGE_FORMAT`,
+  `HARUKI_ASSET_STUDIO_FFI_WORKER_IDLE_TIMEOUT_SECONDS`,
+  `HARUKI_ASSET_STUDIO_FFI_WORKER_GC_HEAP_HARD_LIMIT_MB`,
+  `HARUKI_ASSET_STUDIO_FFI_WORKER_GC_CONSERVE_MEMORY`,
+  `HARUKI_ASSET_STUDIO_FFI_IMAGE_FLUSH_BYTES`,
   `HARUKI_ASSET_HTTP_VERSION`,
   `HARUKI_CPU_BUDGET_AUTO`,
   `HARUKI_CPU_BUDGET_RATIO`,
@@ -144,6 +148,29 @@ You can also download the standalone AssetStudioFFI archive or build the
   isolation. Set it to `direct`, or set `HARUKI_ASSET_STUDIO_FFI_MODE=direct`,
   only for local throughput benchmarks where the service process may load and
   call `HarukiAssetStudioFFI` directly.
+- `concurrency.*` only bounds how many *bundles*/*encode workers* run at once —
+  it does **not** bound the memory each bundle's AssetStudio FFI export uses.
+  The two knobs that actually matter for total memory footprint are:
+  - `backends.asset_studio.process_concurrency`: each unit is a standalone
+    .NET NativeAOT worker process. `0` (auto) defaults to the CPU budget, so
+    on a many-core, memory-constrained host it can spawn far more worker
+    processes than you expect. Set it explicitly (e.g. `2`-`4`) instead of
+    leaving it at auto when memory is tight.
+  - `backends.asset_studio.image_flush_bytes`: bounds how much
+    decoded-but-not-yet-encoded raw RGBA texture data a single bundle can
+    buffer before it's flushed to disk. Without this, a bundle with many/large
+    textures buffers *all* of them uncompressed (a 4096x4096 texture alone is
+    64 MiB) regardless of `concurrency.images`. Defaults to 128 MiB; `0`
+    restores the old "flush once, at the end of the bundle" behaviour.
+  Additional per-worker knobs bound each spawned .NET process directly:
+  `backends.asset_studio.worker_idle_timeout_seconds` (default `120`; kills
+  pooled workers that have sat idle that long, so a traffic burst doesn't
+  leave `process_concurrency` .NET processes permanently resident) and
+  `backends.asset_studio.worker_gc_heap_hard_limit_mb` /
+  `worker_gc_conserve_memory` (opt-in `DOTNET_GCHeapHardLimit` /
+  `DOTNET_GCConserveMemory` caps — useful because each worker's GC otherwise
+  sizes itself against the *whole* container's memory, an assumption that
+  breaks down once more than one worker runs concurrently).
 - `resources.memory.max_in_flight_bundle_bytes` is a soft memory guard. The default
   `0` disables it. On small Linux hosts, set it to the amount of bundle work the
   process may keep in memory, for example
