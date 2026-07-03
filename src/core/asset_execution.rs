@@ -1570,7 +1570,7 @@ impl AssetExecutionContext {
         );
 
         let deobfuscate_started = Instant::now();
-        let deobfuscated = deobfuscate(&body);
+        let deobfuscated = deobfuscate(body);
         Self::send_progress(
             progress,
             ExecutionProgressUpdate::BundleDeobfuscated {
@@ -1609,7 +1609,6 @@ impl AssetExecutionContext {
             }
         })?;
         drop(deobfuscated);
-        drop(body);
         Self::send_progress(
             progress,
             ExecutionProgressUpdate::BundleTempWritten {
@@ -1700,7 +1699,7 @@ impl AssetExecutionContext {
         );
 
         let deobfuscate_started = Instant::now();
-        let deobfuscated = deobfuscate(&body);
+        let deobfuscated = deobfuscate(body);
         Self::send_progress(
             progress,
             ExecutionProgressUpdate::BundleDeobfuscated {
@@ -1890,7 +1889,7 @@ impl AssetExecutionContext {
                 continue;
             }
             let body = self.get_with_retry(&self.render_bundle_url(task)?).await?;
-            let deobfuscated = deobfuscate(&body);
+            let deobfuscated = deobfuscate(body);
             Self::write_haruki_3d_work_bundle(&output_path, &deobfuscated)?;
             downloaded += 1;
             Self::send_progress(
@@ -2219,31 +2218,30 @@ where
         .map_err(|err| AssetExecutionError::AssetInfoDecode(err.to_string()))
 }
 
-pub fn deobfuscate(data: &[u8]) -> Vec<u8> {
+pub fn deobfuscate(mut data: Vec<u8>) -> Vec<u8> {
     const SIMPLE: [u8; 4] = [0x20, 0x00, 0x00, 0x00];
     const XOR_HEADER: [u8; 4] = [0x10, 0x00, 0x00, 0x00];
 
     if data.starts_with(&SIMPLE) {
-        return data[4..].to_vec();
+        data.drain(0..4);
+        return data;
     }
 
     if data.starts_with(&XOR_HEADER) {
-        let body = &data[4..];
-        if body.len() < 128 {
-            return body.to_vec();
+        if data.len() < 132 {
+            data.drain(0..4);
+            return data;
         }
 
-        let mut header = vec![0u8; 128];
         let pattern = [0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00];
         for idx in 0..128 {
-            header[idx] = body[idx] ^ pattern[idx % pattern.len()];
+            data[4 + idx] ^= pattern[idx % pattern.len()];
         }
-        let mut output = header;
-        output.extend_from_slice(&body[128..]);
-        return output;
+        data.drain(0..4);
+        return data;
     }
 
-    data.to_vec()
+    data
 }
 
 pub fn should_download_bundle(

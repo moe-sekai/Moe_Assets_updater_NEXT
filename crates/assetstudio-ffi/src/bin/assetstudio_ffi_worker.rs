@@ -1,5 +1,9 @@
 use std::io::Write;
 use std::io::{self, Read};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
