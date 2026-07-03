@@ -780,6 +780,18 @@ async fn flush_batch(
         "batch committed",
     );
 
+    if let Some(region_config) = config.regions.get(region_name) {
+        if region_config.upload.remove_local_after_upload {
+            for bundle in batch.iter() {
+                if succeeded_bundles.contains(&bundle.bundle_path) {
+                    for file in &bundle.files {
+                        let _ = tokio::fs::remove_file(file).await;
+                    }
+                }
+            }
+        }
+    }
+
     processed_all.extend(succeeded_bundles);
     batch.clear();
     *batch_bytes = 0;
