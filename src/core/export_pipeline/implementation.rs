@@ -22,7 +22,7 @@ use haruki_assetstudio_ffi::{
     AssetStudioFfiContextReadObjectItemRequest, AssetStudioFfiContextReadObjectsRequest,
     AssetStudioFfiError, AssetStudioFfiObjectReadBatchResponse, AssetStudioFfiObjectReadOutput,
     AssetStudioFfiRequest, AssetStudioWorkerPool, LoadedAssetStudioFfiLibrary,
-    NativeBatchPhaseStats, WorkerLease, WorkerLeaseStats, WorkerOutput,
+    NativeBatchPhaseStats, WorkerLease, WorkerLeaseStats, WorkerOutput, WorkerPoolTuning,
 };
 #[cfg(test)]
 use haruki_assetstudio_ffi::{AssetStudioFfiObjectReadResponse, AssetStudioFfiResponse};

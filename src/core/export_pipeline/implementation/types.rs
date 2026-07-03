@@ -110,6 +110,11 @@ pub(super) struct NativeSemanticExportPathState {
     pub(super) written_files: Vec<PathBuf>,
     pub(super) acb_sources: Vec<NativeInMemoryMediaSource>,
     pub(super) pending_image_writes: Vec<PendingNativeImageWrite>,
+    /// Running total of `pending_image_writes[*].payload.len()`. Tracked
+    /// incrementally so the FFI object-read loop can cheaply decide when to
+    /// flush queued images to disk mid-bundle instead of only once the
+    /// whole bundle has been read (see `ImageFlushConfig`).
+    pub(super) pending_image_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +161,21 @@ pub(super) struct NativeObjectExportOptions<'a> {
     pub(super) read_kinds: &'a BTreeMap<String, String>,
     pub(super) image_format: &'a str,
     pub(super) read_batch_size: usize,
+    /// When set, queued raw-RGBA image reads are encoded + written to disk
+    /// once their buffered payload bytes cross `flush_bytes`, instead of
+    /// only once the whole bundle has finished reading. `None` (used by
+    /// unit tests exercising `write_native_object_payload` directly)
+    /// restores the old "queue for the whole bundle, flush once at the
+    /// end" behaviour. See `AssetStudioBackendConfig::image_flush_bytes`.
+    pub(super) image_flush: Option<ImageFlushConfig<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ImageFlushConfig<'a> {
+    pub(super) flush_bytes: usize,
+    pub(super) concurrency: usize,
+    pub(super) cpu_budget: usize,
+    pub(super) image_backend: &'a ImageBackendConfig,
 }
 
 #[derive(Debug, Serialize)]

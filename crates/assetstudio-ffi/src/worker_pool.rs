@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -43,11 +43,32 @@ pub struct WorkerOutput {
     pub payload_file: Option<PathBuf>,
 }
 
+/// Extra tuning knobs for spawned FFI worker processes. Each worker is an
+/// independent .NET NativeAOT process; by default the .NET GC sizes its
+/// generation budgets against the *whole* container's available memory, so
+/// running several of these concurrently (per `process_concurrency`) can
+/// multiply the effective footprint. These knobs let the caller put a hard
+/// ceiling on each worker's heap and make idle workers exit instead of
+/// sitting around holding onto committed memory indefinitely.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkerPoolTuning {
+    /// 0 disables idle reaping (workers only recycle via `max_calls_per_worker`).
+    pub idle_timeout: Duration,
+    /// Per-worker `DOTNET_GCHeapHardLimit`, in megabytes. 0 leaves the .NET
+    /// default (which sizes itself off total container memory) untouched.
+    pub gc_heap_hard_limit_mb: u64,
+    /// `DOTNET_GCConserveMemory` (0-9). Higher values trade GC/allocation
+    /// throughput for returning memory to the OS more aggressively. `None`
+    /// leaves the .NET default untouched.
+    pub gc_conserve_memory: Option<u8>,
+}
+
 pub struct AssetStudioWorkerPool {
     worker_path: PathBuf,
     native_library_path: String,
     process_concurrency: usize,
     max_calls_per_worker: usize,
+    tuning: WorkerPoolTuning,
     semaphore: Arc<Semaphore>,
     available: TokioMutex<Vec<PooledWorker>>,
     next_id: AtomicU64,
@@ -60,6 +81,7 @@ pub struct WorkerPoolStatsSnapshot {
     pub spawned: u64,
     pub recycled: u64,
     pub killed: u64,
+    pub idle_reaped: u64,
     pub protocol_errors: u64,
     pub completed_calls: u64,
     pub max_call_ms: u64,
@@ -77,6 +99,7 @@ struct WorkerPoolStats {
     spawned: AtomicUsize,
     recycled: AtomicUsize,
     killed: AtomicUsize,
+    idle_reaped: AtomicUsize,
     protocol_errors: AtomicUsize,
     completed_calls: AtomicUsize,
     max_call_ms: AtomicU64,
@@ -93,6 +116,7 @@ impl WorkerPoolStats {
             spawned: self.spawned.load(Ordering::Relaxed) as u64,
             recycled: self.recycled.load(Ordering::Relaxed) as u64,
             killed: self.killed.load(Ordering::Relaxed) as u64,
+            idle_reaped: self.idle_reaped.load(Ordering::Relaxed) as u64,
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed) as u64,
             completed_calls: self.completed_calls.load(Ordering::Relaxed) as u64,
             max_call_ms: self.max_call_ms.load(Ordering::Relaxed),
@@ -117,13 +141,32 @@ impl AssetStudioWorkerPool {
         process_concurrency: usize,
         max_calls_per_worker: usize,
     ) -> Arc<Self> {
+        Self::shared_with_tuning(
+            worker_path,
+            native_library_path,
+            process_concurrency,
+            max_calls_per_worker,
+            WorkerPoolTuning::default(),
+        )
+    }
+
+    pub fn shared_with_tuning(
+        worker_path: &Path,
+        native_library_path: &str,
+        process_concurrency: usize,
+        max_calls_per_worker: usize,
+        tuning: WorkerPoolTuning,
+    ) -> Arc<Self> {
         let process_concurrency = process_concurrency.max(1);
         let key = format!(
-            "{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
             process_concurrency,
             max_calls_per_worker,
             worker_path.display(),
-            native_library_path
+            native_library_path,
+            tuning.idle_timeout.as_millis(),
+            tuning.gc_heap_hard_limit_mb,
+            tuning.gc_conserve_memory,
         );
         static POOLS: OnceLock<Mutex<HashMap<String, Arc<AssetStudioWorkerPool>>>> =
             OnceLock::new();
@@ -131,22 +174,30 @@ impl AssetStudioWorkerPool {
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap();
-        pools
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(AssetStudioWorkerPool {
+        let (pool, freshly_created) = match pools.get(&key) {
+            Some(pool) => (pool.clone(), false),
+            None => {
+                let pool = Arc::new(AssetStudioWorkerPool {
                     worker_path: worker_path.to_path_buf(),
                     native_library_path: native_library_path.to_string(),
                     process_concurrency,
                     max_calls_per_worker,
+                    tuning,
                     semaphore: Arc::new(Semaphore::new(process_concurrency)),
                     available: TokioMutex::new(Vec::with_capacity(process_concurrency)),
                     next_id: AtomicU64::new(1),
                     next_worker_id: AtomicU64::new(1),
                     stats: Arc::new(WorkerPoolStats::default()),
-                })
-            })
-            .clone()
+                });
+                pools.insert(key, pool.clone());
+                (pool, true)
+            }
+        };
+        drop(pools);
+        if freshly_created && !tuning.idle_timeout.is_zero() {
+            spawn_idle_reaper(pool.clone());
+        }
+        pool
     }
 
     pub async fn acquire(self: &Arc<Self>) -> Result<WorkerLease, AssetStudioFfiError> {
@@ -159,7 +210,10 @@ impl AssetStudioWorkerPool {
                 AssetStudioFfiError::message(format!("ffi worker pool limiter closed: {source}"))
             })?;
         let worker = match self.available.lock().await.pop() {
-            Some(worker) => worker,
+            Some(mut worker) => {
+                worker.idle_since = None;
+                worker
+            }
             None => self.spawn_worker().await?,
         };
         Ok(WorkerLease {
@@ -202,6 +256,21 @@ impl AssetStudioWorkerPool {
         if let Some(native_library_dir) = native_library_working_dir(&self.native_library_path) {
             command.current_dir(native_library_dir);
         }
+        // Each worker is a standalone .NET NativeAOT process. Left to its
+        // defaults, its GC sizes generation budgets against the *entire*
+        // container's memory — fine for one process, but with
+        // `process_concurrency` workers running side by side those
+        // per-process assumptions stack up fast. Apply explicit per-worker
+        // caps so N workers don't each behave as if they alone own the box.
+        if self.tuning.gc_heap_hard_limit_mb > 0 {
+            command.env(
+                "DOTNET_GCHeapHardLimit",
+                format!("{:x}", self.tuning.gc_heap_hard_limit_mb.saturating_mul(1024 * 1024)),
+            );
+        }
+        if let Some(conserve) = self.tuning.gc_conserve_memory {
+            command.env("DOTNET_GCConserveMemory", conserve.min(9).to_string());
+        }
         let mut child = command
             .spawn()
             .map_err(|source| AssetStudioFfiError::Spawn {
@@ -237,6 +306,7 @@ impl AssetStudioWorkerPool {
             stdin,
             stdout: BufReader::new(stdout),
             completed_calls: 0,
+            idle_since: None,
             stats: self.stats.clone(),
         })
     }
@@ -254,8 +324,73 @@ impl AssetStudioWorkerPool {
             worker.kill().await;
             return;
         }
+        worker.idle_since = Some(Instant::now());
         self.available.lock().await.push(worker);
     }
+
+    /// Kill any pooled worker that has been sitting idle in `available`
+    /// longer than `tuning.idle_timeout`. Called periodically by the
+    /// background reaper task spawned in `shared_with_tuning`. Workers
+    /// currently leased out (mid-call) are untouched since they aren't in
+    /// `available`.
+    async fn reap_idle_workers(&self) {
+        if self.tuning.idle_timeout.is_zero() {
+            return;
+        }
+        let mut expired = Vec::new();
+        {
+            let mut available = self.available.lock().await;
+            let mut index = 0;
+            while index < available.len() {
+                let is_idle_expired = available[index]
+                    .idle_since
+                    .is_some_and(|since| since.elapsed() >= self.tuning.idle_timeout);
+                if is_idle_expired {
+                    expired.push(available.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        let idle_reaped = self
+            .stats
+            .idle_reaped
+            .fetch_add(expired.len(), Ordering::Relaxed)
+            + expired.len();
+        info!(
+            reaped = expired.len(),
+            idle_reaped_total = idle_reaped,
+            idle_timeout_secs = self.tuning.idle_timeout.as_secs(),
+            "reaping idle assetstudio ffi workers to release memory"
+        );
+        for mut worker in expired {
+            worker.kill().await;
+        }
+    }
+}
+
+/// Periodically sweeps `pool.available` for workers that have exceeded the
+/// configured idle timeout and kills them. Runs for the process lifetime;
+/// holds only a `Weak` reference so it doesn't itself keep the pool (and its
+/// live worker processes) artificially alive.
+fn spawn_idle_reaper(pool: Arc<AssetStudioWorkerPool>) {
+    let sweep_interval = (pool.tuning.idle_timeout / 4).max(Duration::from_secs(5));
+    let weak_pool = Arc::downgrade(&pool);
+    drop(pool);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sweep_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Some(pool) = Weak::upgrade(&weak_pool) else {
+                break;
+            };
+            pool.reap_idle_workers().await;
+        }
+    });
 }
 
 pub struct WorkerLease {
@@ -302,6 +437,9 @@ struct PooledWorker {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     completed_calls: usize,
+    /// Set while sitting in `available`; cleared as soon as it's leased out.
+    /// Used by `reap_idle_workers` to find long-idle workers to kill.
+    idle_since: Option<Instant>,
     stats: Arc<WorkerPoolStats>,
 }
 

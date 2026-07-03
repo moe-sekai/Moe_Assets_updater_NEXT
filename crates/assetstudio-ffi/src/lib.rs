@@ -17,6 +17,6 @@ pub use types::{
 };
 pub use worker_pool::{
     configured_worker_path, with_worker_lease, worker_executable_name, AssetStudioWorkerPool,
-    WorkerLease, WorkerLeaseStats, WorkerOutput, WorkerPoolStatsSnapshot, WorkerServerRequest,
-    WorkerServerResponse,
+    WorkerLease, WorkerLeaseStats, WorkerOutput, WorkerPoolStatsSnapshot, WorkerPoolTuning,
+    WorkerServerRequest, WorkerServerResponse,
 };
