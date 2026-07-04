@@ -2,7 +2,8 @@
 //! enabled region, applies Layer-0 watermark pruning, then triggers a full
 //! asset execution + HIP session on version change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +24,6 @@ use crate::core::hip::{CheckAction, CheckBatchItem, CommitStats, HelloParams, Hi
 use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
 use crate::core::regions::select_region;
 use crate::service::watermark::{RegionWatermark, WatermarkStore};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct RegionSnapshot {
@@ -795,35 +795,16 @@ async fn flush_batch(
         .get(region_name)
         .is_some_and(|region_config| region_config.upload.remove_local_after_upload)
     {
-        let mut removed_files = 0usize;
-        let mut failed_files = 0usize;
-        for bundle in batch.iter() {
-            if !succeeded_bundles.contains(&bundle.bundle_path) {
-                continue;
-            }
-            for file in &bundle.files {
-                match tokio::fs::remove_file(file).await {
-                    Ok(()) => removed_files += 1,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        failed_files += 1;
-                        warn!(
-                            region = %region_name,
-                            batch = batch_index,
-                            bundle = %bundle.bundle_path,
-                            path = %file.display(),
-                            error = %err,
-                            "failed to remove local artefact after HIP commit",
-                        );
-                    }
-                }
-            }
-        }
+        let cleanup =
+            remove_committed_bundle_artefacts(region_name, batch_index, batch, &succeeded_bundles)
+                .await;
         info!(
             region = %region_name,
             batch = batch_index,
-            removed_files,
-            failed_files,
+            removed_files = cleanup.removed_files,
+            removed_dirs = cleanup.removed_dirs,
+            failed_files = cleanup.failed_files,
+            failed_dirs = cleanup.failed_dirs,
             "removed local artefacts after HIP commit",
         );
     }
@@ -1210,6 +1191,98 @@ where
     f(runtime);
 }
 
+#[derive(Default)]
+struct CleanupSummary {
+    removed_files: usize,
+    removed_dirs: usize,
+    failed_files: usize,
+    failed_dirs: usize,
+}
+
+async fn remove_committed_bundle_artefacts(
+    region_name: &str,
+    batch_index: u32,
+    batch: &[BundleArtefacts],
+    succeeded_bundles: &HashSet<String>,
+) -> CleanupSummary {
+    let mut summary = CleanupSummary::default();
+    for bundle in batch {
+        if !succeeded_bundles.contains(&bundle.bundle_path) {
+            continue;
+        }
+        for file in &bundle.files {
+            match tokio::fs::remove_file(file).await {
+                Ok(()) => {
+                    summary.removed_files += 1;
+                    match prune_empty_parent_dirs(file, &bundle.export_root) {
+                        Ok(removed) => summary.removed_dirs += removed,
+                        Err(err) => {
+                            summary.failed_dirs += 1;
+                            warn!(
+                                region = %region_name,
+                                batch = batch_index,
+                                bundle = %bundle.bundle_path,
+                                path = %file.display(),
+                                error = %err,
+                                "failed to prune empty local artefact directories after HIP commit",
+                            );
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    summary.failed_files += 1;
+                    warn!(
+                        region = %region_name,
+                        batch = batch_index,
+                        bundle = %bundle.bundle_path,
+                        path = %file.display(),
+                        error = %err,
+                        "failed to remove local artefact after HIP commit",
+                    );
+                }
+            }
+        }
+    }
+    summary
+}
+
+fn prune_empty_parent_dirs(path: &Path, stop_root: &Path) -> std::io::Result<usize> {
+    let stop_root = match std::fs::canonicalize(stop_root) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let mut removed = 0usize;
+    let mut current = match path.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => return Ok(0),
+    };
+
+    loop {
+        let current_canon = match std::fs::canonicalize(&current) {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        };
+        if current_canon == stop_root || !current_canon.starts_with(&stop_root) {
+            break;
+        }
+        match std::fs::remove_dir(&current_canon) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => return Err(err),
+        }
+        let Some(parent) = current_canon.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+
+    Ok(removed)
+}
+
 #[derive(Debug, Clone)]
 struct BundleArtefacts {
     bundle_path: String,
@@ -1286,4 +1359,62 @@ enum PollError {
     Execution(String),
     #[error("hip error: {0}")]
     Hip(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn prune_empty_parent_dirs_stops_at_export_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let nested = root.join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("asset.bin");
+        fs::write(&file, b"x").unwrap();
+        fs::remove_file(&file).unwrap();
+
+        let removed = prune_empty_parent_dirs(&file, &root).unwrap();
+
+        assert_eq!(removed, 3);
+        assert!(root.exists());
+        assert!(!root.join("a").exists());
+    }
+
+    #[test]
+    fn prune_empty_parent_dirs_preserves_non_empty_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let nested = root.join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("a/sibling.bin"), b"keep").unwrap();
+        let file = nested.join("asset.bin");
+        fs::write(&file, b"x").unwrap();
+        fs::remove_file(&file).unwrap();
+
+        let removed = prune_empty_parent_dirs(&file, &root).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(root.join("a").exists());
+        assert!(root.join("a/sibling.bin").exists());
+    }
+
+    #[test]
+    fn prune_empty_parent_dirs_ignores_paths_outside_export_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let other = temp.path().join("other/a");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let file = other.join("asset.bin");
+        fs::write(&file, b"x").unwrap();
+        fs::remove_file(&file).unwrap();
+
+        let removed = prune_empty_parent_dirs(&file, &root).unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(other.exists());
+    }
 }

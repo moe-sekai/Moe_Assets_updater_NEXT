@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
@@ -1148,13 +1148,25 @@ impl AssetExecutionContext {
                 },
             );
         }
+        let mut artefact_files = Vec::new();
+        let mut seen_artefact_files = HashSet::new();
+        for file in job
+            .payload_export
+            .native_written_files
+            .iter()
+            .chain(post_process_summary.generated_files.iter())
+        {
+            if seen_artefact_files.insert(file.clone()) {
+                artefact_files.push(file.clone());
+            }
+        }
         Self::send_progress(
             progress,
             ExecutionProgressUpdate::BundleArtefactsProduced {
                 bundle: job.bundle_path.clone(),
                 bundle_hash: job.bundle_hash.clone(),
                 export_root: post_process_summary.export_root.clone(),
-                files: post_process_summary.generated_files.clone(),
+                files: artefact_files,
             },
         );
         Self::send_progress(
