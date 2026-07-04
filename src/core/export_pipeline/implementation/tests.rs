@@ -324,6 +324,30 @@ fn scan_all_files_finds_nested_files() {
 }
 
 #[test]
+fn post_process_summary_uses_upload_root() {
+    let dir = tempdir().unwrap();
+    let export_path = dir.path().join("live/2dmode/movie");
+    let upload_root = dir.path();
+    let (config, region) = processing_config();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let summary = runtime
+        .block_on(post_process_exported_files(
+            &config,
+            "jp",
+            &region,
+            &export_path,
+            upload_root,
+            false,
+            &[],
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(summary.export_root, upload_root);
+}
+
+#[test]
 fn post_process_sample_files_without_transcoding_if_present() {
     std::thread::Builder::new()
         .name("export-pipeline-sample".to_string())

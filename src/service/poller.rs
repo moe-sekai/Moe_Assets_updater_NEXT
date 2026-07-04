@@ -275,6 +275,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
             && watermark.asset_version == current.asset_version_or_default()
             && watermark.asset_hash == current.asset_hash_or_default()
         {
+            remove_region_work_dir_after_success(&ctx.config, &ctx.region_name).await?;
             return Ok(RunOutcome::SkippedByWatermark);
         }
     }
@@ -465,27 +466,11 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     // Signal uploader by dropping the last artefact sender (our copy lives
     // inside `uploader_setup`); then await its final result.
     let mut processed_bundles: HashSet<String> = check_skipped_bundles.lock().await.clone();
+    let mut uploader_result = Ok(());
     if let Some((artefact_tx, handle)) = uploader_setup {
         drop(artefact_tx);
-        match handle.await {
-            Ok(Ok(uploaded)) => {
-                processed_bundles.extend(uploaded);
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    region = %ctx.region_name,
-                    error = %err,
-                    "uploader task failed; committed batches (if any) are still durable on the gateway",
-                );
-            }
-            Err(join_err) => {
-                warn!(
-                    region = %ctx.region_name,
-                    error = %join_err,
-                    "uploader task panicked",
-                );
-            }
-        }
+        uploader_result =
+            handle_uploader_result(&ctx.region_name, handle.await, &mut processed_bundles);
     }
 
     // Close the long-lived check session cleanly.
@@ -505,24 +490,15 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         "layer1 stats"
     );
 
-    // Persist watermark + Layer 1 snapshot for next tick's diff.
+    uploader_result?;
+
+    // Persist Layer 1 snapshot + watermark for next tick's diff.
     //
     // Watermark is only bumped when the whole region-poll finishes, so a
     // mid-poll crash leaves it stale → next tick re-runs the poll. The
     // layer1 snapshot has been incrementally merged by the uploader after
     // each successful commit, so a re-run's diff already skips whatever
     // batches did land, and only the un-committed remainder is re-processed.
-    let wm = RegionWatermark {
-        asset_version: current.asset_version_or_default(),
-        asset_hash: current.asset_hash_or_default(),
-        app_version: current.app_version_or_default(),
-        bundle_count: summary.discovered_bundles as u64,
-        committed_at: Utc::now(),
-    };
-    ctx.watermarks
-        .set(&ctx.region_name, wm)
-        .await
-        .map_err(|err| PollError::Execution(err.to_string()))?;
     // Build the snapshot for next-tick Layer-1 diff:
     //   * include every bundle that was unchanged (already in old_info with
     //     matching fingerprint — carry forward from new_info),
@@ -549,6 +525,20 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
             "failed to save layer1 snapshot; next tick will still work but layer1 diff will be less effective"
         );
     }
+
+    remove_region_work_dir_after_success(&ctx.config, &ctx.region_name).await?;
+
+    let wm = RegionWatermark {
+        asset_version: current.asset_version_or_default(),
+        asset_hash: current.asset_hash_or_default(),
+        app_version: current.app_version_or_default(),
+        bundle_count: summary.discovered_bundles as u64,
+        committed_at: Utc::now(),
+    };
+    ctx.watermarks
+        .set(&ctx.region_name, wm)
+        .await
+        .map_err(|err| PollError::Execution(err.to_string()))?;
 
     Ok(RunOutcome::Completed)
 }
@@ -673,6 +663,37 @@ async fn run_uploader(
     }
 
     Ok(processed_all)
+}
+
+fn handle_uploader_result(
+    region_name: &str,
+    result: Result<Result<HashSet<String>, PollError>, tokio::task::JoinError>,
+    processed_bundles: &mut HashSet<String>,
+) -> Result<(), PollError> {
+    match result {
+        Ok(Ok(uploaded)) => {
+            processed_bundles.extend(uploaded);
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            warn!(
+                region = %region_name,
+                error = %err,
+                "uploader task failed; committed batches (if any) are still durable on the gateway",
+            );
+            Err(err)
+        }
+        Err(join_err) => {
+            warn!(
+                region = %region_name,
+                error = %join_err,
+                "uploader task panicked",
+            );
+            Err(PollError::Execution(format!(
+                "uploader task panicked: {join_err}"
+            )))
+        }
+    }
 }
 
 /// Upload the current in-memory batch on the currently-held session
@@ -807,6 +828,12 @@ async fn flush_batch(
             failed_dirs = cleanup.failed_dirs,
             "removed local artefacts after HIP commit",
         );
+        if cleanup.has_failures() {
+            return Err(PollError::Execution(format!(
+                "failed to remove local artefacts after HIP commit: {} file(s), {} dir(s)",
+                cleanup.failed_files, cleanup.failed_dirs
+            )));
+        }
     }
 
     processed_all.extend(succeeded_bundles);
@@ -1199,6 +1226,124 @@ struct CleanupSummary {
     failed_dirs: usize,
 }
 
+impl CleanupSummary {
+    fn has_failures(&self) -> bool {
+        self.failed_files > 0 || self.failed_dirs > 0
+    }
+}
+
+async fn remove_region_work_dir_after_success(
+    config: &AppConfig,
+    region_name: &str,
+) -> Result<(), PollError> {
+    if !config.hip.enabled {
+        return Ok(());
+    }
+    let Some(region_config) = config.regions.get(region_name) else {
+        return Ok(());
+    };
+    if !region_config.upload.remove_local_after_upload {
+        return Ok(());
+    }
+    let Some(asset_save_dir) = region_config
+        .paths
+        .asset_save_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let Some(cleanup_dir) = resolve_region_cleanup_dir(region_name, Path::new(asset_save_dir))?
+    else {
+        return Ok(());
+    };
+    tokio::fs::remove_dir_all(&cleanup_dir)
+        .await
+        .map_err(|err| {
+            PollError::Execution(format!(
+                "remove region local work dir {} after HIP success: {err}",
+                cleanup_dir.display()
+            ))
+        })?;
+    info!(
+        region = %region_name,
+        path = %cleanup_dir.display(),
+        "removed region local work dir after HIP success",
+    );
+    Ok(())
+}
+
+fn resolve_region_cleanup_dir(
+    region_name: &str,
+    configured_path: &Path,
+) -> Result<Option<std::path::PathBuf>, PollError> {
+    if configured_path.as_os_str().is_empty() {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir is empty; refusing cleanup"
+        )));
+    }
+
+    let cleanup_dir = match std::fs::canonicalize(configured_path) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(PollError::Execution(format!(
+                "resolve region local work dir {}: {err}",
+                configured_path.display()
+            )));
+        }
+    };
+
+    let metadata = std::fs::metadata(&cleanup_dir).map_err(|err| {
+        PollError::Execution(format!(
+            "inspect region local work dir {}: {err}",
+            cleanup_dir.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir {} is not a directory; refusing cleanup",
+            cleanup_dir.display()
+        )));
+    }
+    if cleanup_dir.parent().is_none() {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir {} resolves to a filesystem root; refusing cleanup",
+            cleanup_dir.display()
+        )));
+    }
+
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|err| PollError::Execution(format!("resolve current directory: {err}")))?;
+    if cleanup_dir == cwd || cwd.starts_with(&cleanup_dir) {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir {} contains the process cwd; refusing cleanup",
+            cleanup_dir.display()
+        )));
+    }
+
+    let Some(dir_name) = cleanup_dir.file_name().and_then(|name| name.to_str()) else {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir {} has no final directory name; refusing cleanup",
+            cleanup_dir.display()
+        )));
+    };
+    if !dir_name
+        .to_ascii_lowercase()
+        .contains(&region_name.to_ascii_lowercase())
+    {
+        return Err(PollError::Config(format!(
+            "region `{region_name}` asset_save_dir {} does not look region-scoped; refusing cleanup",
+            cleanup_dir.display()
+        )));
+    }
+
+    Ok(Some(cleanup_dir))
+}
+
 async fn remove_committed_bundle_artefacts(
     region_name: &str,
     batch_index: u32,
@@ -1416,5 +1561,53 @@ mod tests {
 
         assert_eq!(removed, 0);
         assert!(other.exists());
+    }
+
+    #[test]
+    fn uploader_error_is_returned_to_poller() {
+        let mut processed = HashSet::new();
+
+        let result = handle_uploader_result(
+            "tw",
+            Ok(Err(PollError::Hip("already present".to_string()))),
+            &mut processed,
+        );
+
+        assert!(matches!(result, Err(PollError::Hip(message)) if message == "already present"));
+        assert!(processed.is_empty());
+    }
+
+    #[test]
+    fn uploader_success_extends_processed_bundles() {
+        let mut processed = HashSet::from(["skipped".to_string()]);
+        let uploaded = HashSet::from(["uploaded".to_string()]);
+
+        let result = handle_uploader_result("tw", Ok(Ok(uploaded)), &mut processed);
+
+        assert!(result.is_ok());
+        assert!(processed.contains("skipped"));
+        assert!(processed.contains("uploaded"));
+    }
+
+    #[test]
+    fn resolve_region_cleanup_dir_accepts_region_scoped_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("tw-assets");
+        fs::create_dir_all(&dir).unwrap();
+
+        let resolved = resolve_region_cleanup_dir("tw", &dir).unwrap().unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(dir).unwrap());
+    }
+
+    #[test]
+    fn resolve_region_cleanup_dir_rejects_non_region_scoped_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("Data");
+        fs::create_dir_all(&dir).unwrap();
+
+        let err = resolve_region_cleanup_dir("tw", &dir).unwrap_err();
+
+        assert!(err.to_string().contains("refusing cleanup"));
     }
 }

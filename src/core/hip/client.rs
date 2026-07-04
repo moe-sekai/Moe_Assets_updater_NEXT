@@ -227,7 +227,7 @@ impl HipSession {
             .map_err(|_| HipError::SessionClosed("upload semaphore closed".into()))?;
 
         let stream_id = self.inner.next_stream_id();
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         {
             let mut waiters = self.inner.upload_waiters.lock().await;
             waiters.insert(stream_id, tx);
@@ -244,6 +244,15 @@ impl HipSession {
         self.inner
             .send_frame(FrameType::UploadBegin, codec::encode(&begin)?)
             .await?;
+
+        // The server can reject at UPLOAD_BEGIN when this exact asset already
+        // exists. Treat that as a successful no-op and do not stream chunks;
+        // otherwise the server will see chunks for an unknown stream.
+        match timeout(Duration::from_millis(10), &mut rx).await {
+            Ok(Ok(ack)) => return validate_upload_ack(ack),
+            Ok(Err(_)) => return Err(HipError::SessionClosed("upload reply dropped".into())),
+            Err(_) => {}
+        }
 
         let mut hasher = Sha256::new();
         let mut total_bytes: u64 = 0;
@@ -285,14 +294,7 @@ impl HipSession {
             .map_err(|_| HipError::Timeout(self.inner.config.request_timeout.as_millis() as u64))?
             .map_err(|_| HipError::SessionClosed("upload reply dropped".into()))?;
 
-        if ack.status != "OK" {
-            return Err(HipError::Server {
-                code: ack.status.clone(),
-                message: ack.message.clone().unwrap_or_default(),
-                fatal: false,
-            });
-        }
-        Ok(ack)
+        validate_upload_ack(ack)
     }
 
     pub async fn commit(
@@ -587,6 +589,31 @@ async fn dispatch_frame(inner: &HipSessionInner, frame: Frame) -> Result<(), Hip
     Ok(())
 }
 
+fn validate_upload_ack(ack: UploadAck) -> Result<UploadAck, HipError> {
+    if ack.status == "OK" {
+        return Ok(ack);
+    }
+
+    let message = ack.message.clone().unwrap_or_default();
+    if ack.status.eq_ignore_ascii_case("REJECTED")
+        && message.to_ascii_lowercase().contains("already present")
+    {
+        debug!(
+            stream_id = ack.stream_id,
+            status = %ack.status,
+            message = %message,
+            "hip upload already present; treating as successful no-op"
+        );
+        return Ok(ack);
+    }
+
+    Err(HipError::Server {
+        code: ack.status.clone(),
+        message,
+        fatal: false,
+    })
+}
+
 async fn fail_all_waiters(inner: &HipSessionInner, err: HipError) {
     let mut check = inner.check_waiters.lock().await;
     check.drain().for_each(|(_, tx)| {
@@ -628,3 +655,39 @@ pub use codec::CheckAction as ServerCheckAction;
 // Compile-time sanity: encode/decode used across the module.
 #[allow(dead_code)]
 fn _codec_use<T: Serialize>(_: &T) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_ack_already_present_is_successful_noop() {
+        let ack = UploadAck {
+            stream_id: 7,
+            status: "REJECTED".to_string(),
+            placement: None,
+            server_sha256: None,
+            storage_key: None,
+            message: Some("already present".to_string()),
+        };
+
+        let accepted = validate_upload_ack(ack).unwrap();
+
+        assert_eq!(accepted.stream_id, 7);
+        assert_eq!(accepted.status, "REJECTED");
+    }
+
+    #[test]
+    fn upload_ack_other_rejection_is_error() {
+        let ack = UploadAck {
+            stream_id: 8,
+            status: "REJECTED".to_string(),
+            placement: None,
+            server_sha256: None,
+            storage_key: None,
+            message: Some("quota exceeded".to_string()),
+        };
+
+        assert!(validate_upload_ack(ack).is_err());
+    }
+}

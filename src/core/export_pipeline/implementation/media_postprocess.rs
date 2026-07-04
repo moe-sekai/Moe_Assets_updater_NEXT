@@ -14,13 +14,13 @@ pub async fn post_process_exported_files(
     configure_cpu_budget_throttle(&app_config.resources, app_config.effective_cpu_budget());
     if !export_path.exists() {
         return Ok(PostProcessSummary {
-            export_root: export_path.to_path_buf(),
+            export_root: upload_root.to_path_buf(),
             ..PostProcessSummary::default()
         });
     }
 
     let mut summary = PostProcessSummary {
-        export_root: export_path.to_path_buf(),
+        export_root: upload_root.to_path_buf(),
         ..PostProcessSummary::default()
     };
     let concurrency = app_config.effective_concurrency();
