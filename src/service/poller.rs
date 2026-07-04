@@ -1503,10 +1503,8 @@ async fn upload_bundle_artefacts(
             if !file.exists() || !file.is_file() {
                 continue;
             }
-            let asset_path = match file.strip_prefix(&bundle.export_root) {
-                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-                Err(_) => file.to_string_lossy().replace('\\', "/"),
-            };
+            let asset_path =
+                hip_asset_path_for_file(file, &bundle.export_root, &bundle.bundle_path);
             let ack = session
                 .upload_file(
                     bundle.bundle_path.as_str(),
@@ -1539,6 +1537,28 @@ async fn upload_bundle_artefacts(
         stats,
         succeeded_bundles,
     })
+}
+
+fn hip_asset_path_for_file(
+    file: &std::path::Path,
+    export_root: &std::path::Path,
+    bundle_path: &str,
+) -> String {
+    let relative = match file.strip_prefix(export_root) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => file.to_string_lossy().replace('\\', "/"),
+    };
+    let relative = relative.trim_start_matches('/').to_string();
+    let bundle_path = bundle_path.replace('\\', "/");
+    let bundle_path = bundle_path.trim_matches('/');
+    if bundle_path.is_empty() {
+        return relative;
+    }
+    relative
+        .strip_prefix(bundle_path)
+        .and_then(|value| value.strip_prefix('/'))
+        .unwrap_or(&relative)
+        .to_string()
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -1606,6 +1626,36 @@ mod tests {
 
         assert_eq!(removed, 0);
         assert!(other.exists());
+    }
+
+    #[test]
+    fn hip_asset_path_strips_bundle_prefix_from_region_export_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let sound_file = root.join("sound/scenario/bgm/bgm001/bgm001.mp3");
+        assert_eq!(
+            hip_asset_path_for_file(&sound_file, root, "sound/scenario/bgm/bgm001"),
+            "bgm001.mp3"
+        );
+
+        let mesh_file = root.join("mysekai/fixture/mdl_foo/mdl_foo.obj");
+        assert_eq!(
+            hip_asset_path_for_file(&mesh_file, root, "mysekai/fixture/mdl_foo"),
+            "mdl_foo.obj"
+        );
+    }
+
+    #[test]
+    fn hip_asset_path_keeps_paths_already_relative_to_bundle_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("mysekai/fixture/mdl_foo");
+        let file = bundle_root.join("mdl_foo.obj");
+
+        assert_eq!(
+            hip_asset_path_for_file(&file, &bundle_root, "mysekai/fixture/mdl_foo"),
+            "mdl_foo.obj"
+        );
     }
 
     #[test]
