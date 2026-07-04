@@ -449,7 +449,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         reporter.finish();
     });
 
-    let summary = executor
+    let execution_result = executor
         .execute_with_filter(
             &ctx.config,
             Some(progress_tx),
@@ -457,7 +457,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
             Some(filter),
         )
         .await
-        .map_err(|err| PollError::Execution(err.to_string()))?;
+        .map_err(|err| PollError::Execution(err.to_string()));
 
     // Drain forwarder — its `recv()` returns None once the executor drops
     // its progress_tx, which happened inside execute_with_filter above.
@@ -490,7 +490,36 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         "layer1 stats"
     );
 
-    uploader_result?;
+    if let Err(err) = &execution_result {
+        persist_processed_snapshot(
+            &ctx.region_name,
+            &snapshot_path,
+            &new_info,
+            old_info.as_ref(),
+            &processed_bundles,
+        );
+        if let Err(upload_err) = uploader_result {
+            warn!(
+                region = %ctx.region_name,
+                error = %upload_err,
+                "uploader also failed while preserving partial poll progress",
+            );
+        }
+        return Err(err.clone());
+    }
+
+    if let Err(err) = uploader_result {
+        persist_processed_snapshot(
+            &ctx.region_name,
+            &snapshot_path,
+            &new_info,
+            old_info.as_ref(),
+            &processed_bundles,
+        );
+        return Err(err);
+    }
+
+    let summary = execution_result.expect("execution_result is Ok after error branch");
 
     // Persist Layer 1 snapshot + watermark for next tick's diff.
     //
@@ -506,25 +535,13 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     //     (Layer 2 SKIP or upload OK),
     //   * exclude everything else (they'll be seen again as `added` /
     //     `changed` next tick and re-attempted).
-    let snapshot_to_save = build_next_snapshot(&new_info, old_info.as_ref(), &processed_bundles);
-    let dropped = new_info
-        .bundles
-        .len()
-        .saturating_sub(snapshot_to_save.bundles.len());
-    if dropped > 0 {
-        info!(
-            region = %ctx.region_name,
-            dropped_from_snapshot = dropped,
-            "layer1 snapshot omits bundles not processed this run"
-        );
-    }
-    if let Err(err) = bundle_diff::save_snapshot(&snapshot_path, &snapshot_to_save) {
-        warn!(
-            region = %ctx.region_name,
-            error = %err,
-            "failed to save layer1 snapshot; next tick will still work but layer1 diff will be less effective"
-        );
-    }
+    persist_processed_snapshot(
+        &ctx.region_name,
+        &snapshot_path,
+        &new_info,
+        old_info.as_ref(),
+        &processed_bundles,
+    );
 
     remove_region_work_dir_after_success(&ctx.config, &ctx.region_name).await?;
 
@@ -908,6 +925,34 @@ fn build_next_snapshot(
         // Case C: everything else (new or changed but not processed) is omitted.
     }
     carry
+}
+
+fn persist_processed_snapshot(
+    region_name: &str,
+    snapshot_path: &Path,
+    new_info: &crate::core::asset_execution::AssetBundleInfo,
+    old_info: Option<&crate::core::asset_execution::AssetBundleInfo>,
+    processed_bundles: &HashSet<String>,
+) {
+    let snapshot_to_save = build_next_snapshot(new_info, old_info, processed_bundles);
+    let dropped = new_info
+        .bundles
+        .len()
+        .saturating_sub(snapshot_to_save.bundles.len());
+    if dropped > 0 {
+        info!(
+            region = %region_name,
+            dropped_from_snapshot = dropped,
+            "layer1 snapshot omits bundles not processed this run"
+        );
+    }
+    if let Err(err) = bundle_diff::save_snapshot(snapshot_path, &snapshot_to_save) {
+        warn!(
+            region = %region_name,
+            error = %err,
+            "failed to save layer1 snapshot; next tick will still work but layer1 diff will be less effective"
+        );
+    }
 }
 
 fn build_reusable_client(config: &AppConfig) -> Result<reqwest::Client, PollError> {
@@ -1496,7 +1541,7 @@ async fn upload_bundle_artefacts(
     })
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 enum PollError {
     #[error("config error: {0}")]
     Config(String),

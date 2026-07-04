@@ -1850,14 +1850,7 @@ pub struct RegionFiltersConfig {
     pub priority: Vec<String>,
 }
 
-pub const DEFAULT_ASSET_STUDIO_EXPORT_TYPES: &[&str] = &[
-    "monoBehaviour",
-    "textAsset",
-    "tex2d",
-    "tex2dArray",
-    "sprite",
-    "audio",
-];
+pub const DEFAULT_ASSET_STUDIO_EXPORT_TYPES: &[&str] = &["monoBehaviour", "textAsset", "audio"];
 
 fn default_asset_studio_export_types() -> Vec<String> {
     DEFAULT_ASSET_STUDIO_EXPORT_TYPES

@@ -1,33 +1,40 @@
 use super::*;
 
+const MESH_PATH_EXTRA_EXPORT_TYPES: &[&str] = &["tex2d", "tex2dArray", "sprite", "mesh"];
+
 pub(super) fn asset_studio_export_type_list(
     region: &RegionConfig,
     bundle_path: &str,
 ) -> Vec<String> {
     let mut export_types = Vec::new();
     for asset_type in &region.export.asset_studio_types {
-        let asset_type = asset_type.trim();
-        let asset_type = assetstudio_export_type_selector(asset_type).unwrap_or(asset_type);
-        if asset_type.is_empty() || export_types.iter().any(|value| value == asset_type) {
-            continue;
-        }
-        export_types.push(asset_type.to_string());
+        append_asset_studio_export_type(&mut export_types, asset_type);
     }
 
     if export_types.is_empty() {
-        export_types = DEFAULT_ASSET_STUDIO_EXPORT_TYPES
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect();
+        append_asset_studio_export_types(&mut export_types, DEFAULT_ASSET_STUDIO_EXPORT_TYPES);
     }
 
-    if should_export_mesh_for_bundle(region, bundle_path)
-        && !export_types.iter().any(|value| value == "mesh")
-    {
-        export_types.push("mesh".to_string());
+    if should_export_mesh_for_bundle(region, bundle_path) {
+        append_asset_studio_export_types(&mut export_types, MESH_PATH_EXTRA_EXPORT_TYPES);
     }
 
     export_types
+}
+
+fn append_asset_studio_export_types(export_types: &mut Vec<String>, asset_types: &[&str]) {
+    for asset_type in asset_types {
+        append_asset_studio_export_type(export_types, asset_type);
+    }
+}
+
+fn append_asset_studio_export_type(export_types: &mut Vec<String>, asset_type: &str) {
+    let asset_type = asset_type.trim();
+    let asset_type = assetstudio_export_type_selector(asset_type).unwrap_or(asset_type);
+    if asset_type.is_empty() || export_types.iter().any(|value| value == asset_type) {
+        return;
+    }
+    export_types.push(asset_type.to_string());
 }
 
 fn should_export_mesh_for_bundle(region: &RegionConfig, bundle_path: &str) -> bool {

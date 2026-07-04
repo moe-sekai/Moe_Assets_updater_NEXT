@@ -55,7 +55,7 @@ pub(super) fn semantic_assetstudio_object_output_path(
             None
         }
         "sprite" => Some("sprite"),
-        "mesh" => Some("mesh"),
+        "mesh" => return default_path,
         "animator" => Some("animator"),
         "font" => return named_flat_subasset_output_path(&default_path, asset),
         "monobehaviour" | "monobehavior" => Some("monobehaviour"),

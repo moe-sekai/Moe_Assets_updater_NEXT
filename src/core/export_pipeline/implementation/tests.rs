@@ -19,7 +19,7 @@ use crate::core::config::{
 use crate::core::errors::ExportPipelineError;
 
 use super::{
-    acquire_cpu_budget_permit_blocking, acquire_media_encode_permit,
+    acquire_cpu_budget_permit_blocking, acquire_media_encode_permit, asset_studio_export_type_list,
     assetstudio_export_type_selector, assetstudio_fix_file_name,
     assetstudio_object_mode_supported_type, assetstudio_type_selector_matches,
     convert_native_surrogate_images_to_png, extract_unity_asset_bundle,
@@ -138,6 +138,42 @@ fn get_export_group_matches_go_rules() {
     assert_eq!(get_export_group("fix_prefab/mc_new/x"), "containerFull");
     assert_eq!(get_export_group("mysekai/character/a"), "containerFull");
     assert_eq!(get_export_group("other/path"), "container");
+}
+
+#[test]
+fn mesh_path_patterns_add_mesh_and_texture_export_types() {
+    let (_config, mut region) = processing_config();
+    region.export.asset_studio_types = vec![
+        "monoBehaviour".to_string(),
+        "textAsset".to_string(),
+        "audio".to_string(),
+    ];
+    region.export.mesh.export_obj = true;
+    region.export.mesh.path_patterns = vec!["^mysekai/fixture(?:/|$)".to_string()];
+
+    let matched = asset_studio_export_type_list(&region, "mysekai/fixture/foo");
+    assert_eq!(
+        matched,
+        vec![
+            "monoBehaviour".to_string(),
+            "textAsset".to_string(),
+            "audio".to_string(),
+            "tex2d".to_string(),
+            "tex2dArray".to_string(),
+            "sprite".to_string(),
+            "mesh".to_string(),
+        ]
+    );
+
+    let unmatched = asset_studio_export_type_list(&region, "character/member/foo");
+    assert_eq!(
+        unmatched,
+        vec![
+            "monoBehaviour".to_string(),
+            "textAsset".to_string(),
+            "audio".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -2059,7 +2095,7 @@ fn non_character_sprite_objects_route_under_container_sprite_directory() {
 }
 
 #[test]
-fn mesh_objects_route_under_container_mesh_directory() {
+fn mesh_objects_use_legacy_container_obj_path() {
     let asset = AssetStudioFfiAssetInfo {
         index: 0,
         name: Some("body".to_string()),
@@ -2087,7 +2123,7 @@ fn mesh_objects_route_under_container_mesh_directory() {
 
     assert_eq!(
         target,
-        PathBuf::from("/tmp/out/mysekai/effect/common/fbx/model.assets/mesh/body.obj")
+        PathBuf::from("/tmp/out/mysekai/effect/common/fbx/model.obj")
     );
 }
 
