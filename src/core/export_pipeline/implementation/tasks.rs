@@ -1,6 +1,6 @@
 use super::*;
 
-const MESH_PATH_EXTRA_EXPORT_TYPES: &[&str] = &["tex2d", "tex2dArray", "sprite", "mesh"];
+const MESH_PATH_EXTRA_EXPORT_TYPES: &[&str] = &["tex2d", "tex2dArray", "mesh"];
 
 pub(super) fn asset_studio_export_type_list(
     region: &RegionConfig,

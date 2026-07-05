@@ -160,7 +160,6 @@ fn mesh_path_patterns_add_mesh_and_texture_export_types() {
             "audio".to_string(),
             "tex2d".to_string(),
             "tex2dArray".to_string(),
-            "sprite".to_string(),
             "mesh".to_string(),
         ]
     );
