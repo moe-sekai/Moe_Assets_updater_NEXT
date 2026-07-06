@@ -454,29 +454,54 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         reporter.finish();
     });
 
-    let execution_result = executor
-        .execute_with_filter(
-            &ctx.config,
-            Some(progress_tx),
-            Some(cancel_flag.clone()),
-            Some(filter),
-        )
-        .await
-        .map_err(|err| PollError::Execution(err.to_string()));
-
-    // Drain forwarder — its `recv()` returns None once the executor drops
-    // its progress_tx, which happened inside execute_with_filter above.
-    let _ = forwarder.await;
-
-    // Signal uploader by dropping the last artefact sender (our copy lives
-    // inside `uploader_setup`); then await its final result.
     let mut processed_bundles: HashSet<String> =
         check_skipped_bundles.lock().await.keys().cloned().collect();
     let mut uploader_result = Ok(());
-    if let Some((artefact_tx, handle)) = uploader_setup {
-        drop(artefact_tx);
-        uploader_result =
-            handle_uploader_result(&ctx.region_name, handle.await, &mut processed_bundles);
+    let execution_result;
+
+    let execution = executor.execute_with_filter(
+        &ctx.config,
+        Some(progress_tx),
+        Some(cancel_flag.clone()),
+        Some(filter),
+    );
+    tokio::pin!(execution);
+
+    if let Some((artefact_tx, mut handle)) = uploader_setup {
+        tokio::select! {
+            result = &mut execution => {
+                execution_result = result.map_err(|err| PollError::Execution(err.to_string()));
+                // Drain forwarder — its `recv()` returns None once the executor
+                // drops its progress_tx, which happened above.
+                let _ = forwarder.await;
+                // Signal uploader by dropping the last artefact sender (our copy
+                // lives inside `uploader_setup`); then await its final result.
+                drop(artefact_tx);
+                uploader_result =
+                    handle_uploader_result(&ctx.region_name, handle.await, &mut processed_bundles);
+            }
+            result = &mut handle => {
+                uploader_result =
+                    handle_uploader_result(&ctx.region_name, result, &mut processed_bundles);
+                if uploader_result.is_err() {
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                    warn!(
+                        region = %ctx.region_name,
+                        "uploader failed before executor finished; cancelling region execution",
+                    );
+                }
+                execution_result = execution
+                    .await
+                    .map_err(|err| PollError::Execution(err.to_string()));
+                let _ = forwarder.await;
+                drop(artefact_tx);
+            }
+        }
+    } else {
+        execution_result = execution
+            .await
+            .map_err(|err| PollError::Execution(err.to_string()));
+        let _ = forwarder.await;
     }
 
     // Close the long-lived check session cleanly.
