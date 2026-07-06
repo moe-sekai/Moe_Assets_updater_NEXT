@@ -28,7 +28,7 @@ use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
 use crate::core::regions::select_region;
 use crate::service::watermark::{RegionWatermark, WatermarkStore};
 
-const FAILED_REGION_RETRY_ATTEMPTS: usize = 3;
+const FAILED_REGION_RETRY_ATTEMPTS: usize = 10;
 const FAILED_REGION_RETRY_BACKOFF_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
@@ -569,6 +569,11 @@ async fn execute_once_attempt(
         layer1_filtered_at_runtime = layer1_skipped_at_filter,
         "layer1 stats"
     );
+
+    if uploader_result.is_ok() {
+        let check_skipped = check_skipped_bundles.lock().await;
+        processed_bundles.extend(check_skipped.keys().cloned());
+    }
 
     if let Err(err) = &execution_result {
         persist_processed_snapshot(
