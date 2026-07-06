@@ -12,7 +12,7 @@ pub mod frame;
 pub use client::{HelloParams, HipClient, HipClientConfig, HipSession, PlacementHint};
 pub use codec::{
     CheckAckItem, CheckAction, CheckBatch, CheckBatchItem, CheckResult, Commit, CommitAck,
-    CommitStats, Hello, HelloAck, UploadAck, UploadBegin, UploadEnd,
+    CommitBundleCompletion, CommitStats, Hello, HelloAck, UploadAck, UploadBegin, UploadEnd,
 };
 pub use errors::HipError;
 pub use frame::{Frame, FrameType, MAX_DEFAULT_FRAME_BYTES};

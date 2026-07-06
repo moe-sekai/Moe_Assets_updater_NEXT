@@ -20,7 +20,9 @@ use crate::core::asset_execution::{
 };
 use crate::core::bundle_diff;
 use crate::core::config::AppConfig;
-use crate::core::hip::{CheckAction, CheckBatchItem, CommitStats, HelloParams, HipClient};
+use crate::core::hip::{
+    CheckAction, CheckBatchItem, CommitBundleCompletion, CommitStats, HelloParams, HipClient,
+};
 use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
 use crate::core::regions::select_region;
 use crate::service::watermark::{RegionWatermark, WatermarkStore};
@@ -348,8 +350,8 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     let layer1_skipped_before_check = diff.stats.unchanged;
 
     let check_skipped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let check_skipped_bundles: Arc<tokio::sync::Mutex<HashSet<String>>> =
-        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let check_skipped_bundles: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let filter = CombinedFilter {
         layer1_allow: Arc::new(changed_names),
         layer1_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -384,6 +386,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         let new_info_for_upload = new_info.clone();
         let layer1_skipped_at_filter_for_upload = layer1_counter.clone();
         let check_skipped_counter_for_upload = check_skipped_counter.clone();
+        let check_skipped_bundles_for_upload = check_skipped_bundles.clone();
         let cancel_for_upload = ctx.cancel.clone();
         let handle = tokio::spawn(async move {
             run_uploader(
@@ -397,6 +400,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
                 artefact_rx,
                 layer1_skipped_at_filter_for_upload,
                 check_skipped_counter_for_upload,
+                check_skipped_bundles_for_upload,
                 cancel_for_upload,
             )
             .await
@@ -465,7 +469,8 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
 
     // Signal uploader by dropping the last artefact sender (our copy lives
     // inside `uploader_setup`); then await its final result.
-    let mut processed_bundles: HashSet<String> = check_skipped_bundles.lock().await.clone();
+    let mut processed_bundles: HashSet<String> =
+        check_skipped_bundles.lock().await.keys().cloned().collect();
     let mut uploader_result = Ok(());
     if let Some((artefact_tx, handle)) = uploader_setup {
         drop(artefact_tx);
@@ -581,6 +586,7 @@ async fn run_uploader(
     mut artefact_rx: tokio::sync::mpsc::Receiver<BundleArtefacts>,
     layer1_skipped_at_filter: Arc<std::sync::atomic::AtomicU64>,
     check_skipped_counter: Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_bundles: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     cancel: CancellationToken,
 ) -> Result<HashSet<String>, PollError> {
     // Copy of the effective thresholds (either > 0 means the trigger is on).
@@ -641,6 +647,7 @@ async fn run_uploader(
                                 &mut first_commit_pending,
                                 &layer1_skipped_at_filter,
                                 &check_skipped_counter,
+                                &check_skipped_bundles,
                             )
                             .await?;
                         }
@@ -668,6 +675,20 @@ async fn run_uploader(
             &mut first_commit_pending,
             &layer1_skipped_at_filter,
             &check_skipped_counter,
+            &check_skipped_bundles,
+        )
+        .await?;
+    } else if first_commit_pending {
+        flush_metadata_only_commit(
+            &config,
+            &region_name,
+            &current,
+            &run_id,
+            &mut session_opt,
+            &mut first_commit_pending,
+            &layer1_skipped_at_filter,
+            &check_skipped_counter,
+            &check_skipped_bundles,
         )
         .await?;
     } else if let Some(session_arc) = session_opt.take() {
@@ -717,6 +738,32 @@ fn handle_uploader_result(
 /// (opening one if needed), COMMIT it, close the session, and merge the
 /// successfully-uploaded bundles into the on-disk layer-1 snapshot so a
 /// later crash can resume.
+async fn take_first_commit_extras(
+    first_commit_pending: &mut bool,
+    layer1_skipped_at_filter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_counter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_bundles: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+) -> (u64, u64, Vec<CommitBundleCompletion>) {
+    if !*first_commit_pending {
+        return (0, 0, Vec::new());
+    }
+    *first_commit_pending = false;
+
+    let skipped_layer1 = layer1_skipped_at_filter.load(std::sync::atomic::Ordering::Relaxed);
+    let skipped_check = check_skipped_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let skipped_bundles = check_skipped_bundles.lock().await;
+    let mut completed: Vec<CommitBundleCompletion> = skipped_bundles
+        .iter()
+        .map(|(path, fingerprint)| CommitBundleCompletion {
+            path: path.clone(),
+            fingerprint: fingerprint.clone(),
+            source: "check_skip".to_string(),
+        })
+        .collect();
+    completed.sort_by(|a, b| a.path.cmp(&b.path));
+    (skipped_layer1, skipped_check, completed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn flush_batch(
     config: &Arc<AppConfig>,
@@ -733,6 +780,7 @@ async fn flush_batch(
     first_commit_pending: &mut bool,
     layer1_skipped_at_filter: &Arc<std::sync::atomic::AtomicU64>,
     check_skipped_counter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_bundles: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 ) -> Result<(), PollError> {
     if batch.is_empty() {
         return Ok(());
@@ -762,13 +810,16 @@ async fn flush_batch(
         uploaded_shared: outcome.stats.uploaded_shared,
         uploaded_override: outcome.stats.uploaded_override,
     };
-    if *first_commit_pending {
-        commit_stats.skipped_by_layer1 =
-            layer1_skipped_at_filter.load(std::sync::atomic::Ordering::Relaxed);
-        commit_stats.skipped_by_check =
-            check_skipped_counter.load(std::sync::atomic::Ordering::Relaxed);
-        *first_commit_pending = false;
-    }
+    let (skipped_by_layer1, skipped_by_check, mut completed_bundles) = take_first_commit_extras(
+        first_commit_pending,
+        layer1_skipped_at_filter,
+        check_skipped_counter,
+        check_skipped_bundles,
+    )
+    .await;
+    commit_stats.skipped_by_layer1 = skipped_by_layer1;
+    commit_stats.skipped_by_check = skipped_by_check;
+    completed_bundles.extend(outcome.completed_bundles.clone());
 
     let succeeded_bundles = outcome.succeeded_bundles.clone();
 
@@ -781,7 +832,11 @@ async fn flush_batch(
     // index.
     let session_arc = session_opt.take().expect("session_opt was Some");
     session_arc
-        .commit(succeeded_bundles.len() as u64, commit_stats)
+        .commit(
+            succeeded_bundles.len() as u64,
+            commit_stats,
+            completed_bundles,
+        )
         .await
         .map_err(|err| PollError::Hip(err.to_string()))?;
     if let Ok(owned) = Arc::try_unwrap(session_arc) {
@@ -856,6 +911,64 @@ async fn flush_batch(
     processed_all.extend(succeeded_bundles);
     batch.clear();
     *batch_bytes = 0;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_metadata_only_commit(
+    config: &Arc<AppConfig>,
+    region_name: &str,
+    current: &CurrentVersionInfo,
+    run_id: &str,
+    session_opt: &mut Option<Arc<crate::core::hip::HipSession>>,
+    first_commit_pending: &mut bool,
+    layer1_skipped_at_filter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_counter: &Arc<std::sync::atomic::AtomicU64>,
+    check_skipped_bundles: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+) -> Result<(), PollError> {
+    let (skipped_by_layer1, skipped_by_check, completed_bundles) = take_first_commit_extras(
+        first_commit_pending,
+        layer1_skipped_at_filter,
+        check_skipped_counter,
+        check_skipped_bundles,
+    )
+    .await;
+
+    if completed_bundles.is_empty() {
+        if let Some(session_arc) = session_opt.take() {
+            if let Ok(owned) = Arc::try_unwrap(session_arc) {
+                let _ = owned.close().await;
+            }
+        }
+        return Ok(());
+    }
+
+    if session_opt.is_none() {
+        *session_opt = Some(connect_hip_with(config, region_name, current, run_id).await?);
+    }
+    let session_arc = session_opt.take().expect("session_opt was Some");
+    let completed_count = completed_bundles.len();
+    info!(
+        region = %region_name,
+        bundles = completed_count,
+        "committing HIP metadata-only bundle completions",
+    );
+    session_arc
+        .commit(
+            0,
+            CommitStats {
+                skipped_by_layer1,
+                skipped_by_check,
+                uploaded_shared: 0,
+                uploaded_override: 0,
+            },
+            completed_bundles,
+        )
+        .await
+        .map_err(|err| PollError::Hip(err.to_string()))?;
+    if let Ok(owned) = Arc::try_unwrap(session_arc) {
+        let _ = owned.close().await;
+    }
     Ok(())
 }
 
@@ -1111,11 +1224,10 @@ impl ProgressReporter {
         self.last_logged_at = Instant::now();
         self.last_logged_percent_bucket = bucket;
         let processed = self.completed + self.failed;
-        let percent_x10 = if self.planned == 0 {
-            0
-        } else {
-            processed * 1000 / self.planned
-        };
+        let percent_x10 = processed
+            .saturating_mul(1000)
+            .checked_div(self.planned)
+            .unwrap_or_default();
         info!(
             region = %self.region_name,
             phase = %self.phase,
@@ -1186,7 +1298,7 @@ struct HipCheckFilter {
     /// Bundle paths that Layer 2 (HIP CHECK) marked as SKIP. Used to
     /// preserve them in the next snapshot (they are effectively "processed"
     /// because the gateway already has them from another region).
-    skipped_bundles: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    skipped_bundles: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl PreDownloadTaskFilter for HipCheckFilter {
@@ -1232,7 +1344,7 @@ impl PreDownloadTaskFilter for HipCheckFilter {
                         Some(CheckAction::Skip) => {
                             self.skipped_counter
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            skipped_set.insert(task.bundle_path.clone());
+                            skipped_set.insert(task.bundle_path.clone(), task.bundle_hash.clone());
                             debug!(
                                 region = %region_name,
                                 bundle = %task.bundle_path,
@@ -1485,6 +1597,7 @@ struct UploadOutcome {
     stats: CommitStats,
     /// Bundle paths for which all artefacts uploaded successfully.
     succeeded_bundles: HashSet<String>,
+    completed_bundles: Vec<CommitBundleCompletion>,
 }
 
 /// Upload every export product per bundle over HIP.
@@ -1497,8 +1610,9 @@ async fn upload_bundle_artefacts(
 ) -> Result<UploadOutcome, PollError> {
     let mut stats = CommitStats::default();
     let mut succeeded_bundles = HashSet::new();
+    let mut completed_bundles = Vec::new();
     for bundle in bundles {
-        let mut bundle_ok = true;
+        let mut uploaded_or_present_files = 0usize;
         for file in &bundle.files {
             if !file.exists() || !file.is_file() {
                 continue;
@@ -1513,15 +1627,13 @@ async fn upload_bundle_artefacts(
                     file,
                 )
                 .await
-                .map_err(|err| {
-                    bundle_ok = false;
-                    PollError::Hip(err.to_string())
-                })?;
+                .map_err(|err| PollError::Hip(err.to_string()))?;
             match ack.placement {
                 Some(crate::core::hip::codec::Placement::Shared) => stats.uploaded_shared += 1,
                 Some(crate::core::hip::codec::Placement::Override) => stats.uploaded_override += 1,
                 None => stats.uploaded_shared += 1,
             }
+            uploaded_or_present_files += 1;
             debug!(
                 region = %region_name,
                 bundle = %bundle.bundle_path,
@@ -1529,13 +1641,21 @@ async fn upload_bundle_artefacts(
                 "hip upload OK"
             );
         }
-        if bundle_ok {
-            succeeded_bundles.insert(bundle.bundle_path.clone());
-        }
+        succeeded_bundles.insert(bundle.bundle_path.clone());
+        completed_bundles.push(CommitBundleCompletion {
+            path: bundle.bundle_path.clone(),
+            fingerprint: bundle.bundle_hash.clone(),
+            source: if uploaded_or_present_files == 0 {
+                "zero_file".to_string()
+            } else {
+                "uploaded".to_string()
+            },
+        });
     }
     Ok(UploadOutcome {
         stats,
         succeeded_bundles,
+        completed_bundles,
     })
 }
 

@@ -263,7 +263,10 @@ async fn hip_check_batch_and_commit() {
     assert_eq!(results[1].action, CheckAction::Upload);
 
     // COMMIT
-    let commit = session.commit(2, CommitStats::default()).await.unwrap();
+    let commit = session
+        .commit(2, CommitStats::default(), Vec::new())
+        .await
+        .unwrap();
     assert_eq!(commit.version_id, 1);
     let _ = session.close().await;
 

@@ -24,8 +24,9 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use super::codec::{
-    self, CheckAckItem, CheckBatch, CheckBatchItem, CheckResult, Commit, CommitAck, CommitStats,
-    Hello, HelloAck, HipErrorPayload, Placement, UploadAck, UploadBegin, UploadEnd, Window,
+    self, CheckAckItem, CheckBatch, CheckBatchItem, CheckResult, Commit, CommitAck,
+    CommitBundleCompletion, CommitStats, Hello, HelloAck, HipErrorPayload, Placement, UploadAck,
+    UploadBegin, UploadEnd, Window,
 };
 use super::errors::HipError;
 use super::frame::{read_frame, write_frame, Frame, FrameType, MAX_DEFAULT_FRAME_BYTES};
@@ -301,6 +302,7 @@ impl HipSession {
         &self,
         bundle_count: u64,
         stats: CommitStats,
+        completed_bundles: Vec<CommitBundleCompletion>,
     ) -> Result<CommitAck, HipError> {
         let rx = {
             let mut slot = self.inner.commit_waiter.lock().await;
@@ -315,6 +317,7 @@ impl HipSession {
         let payload = codec::encode(&Commit {
             bundle_count,
             stats,
+            completed_bundles,
         })?;
         self.inner.send_frame(FrameType::Commit, payload).await?;
 

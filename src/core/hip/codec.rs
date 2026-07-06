@@ -125,9 +125,18 @@ pub struct CommitStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitBundleCompletion {
+    pub path: String,
+    pub fingerprint: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     pub bundle_count: u64,
     pub stats: CommitStats,
+    #[serde(default)]
+    pub completed_bundles: Vec<CommitBundleCompletion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

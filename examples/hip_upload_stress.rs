@@ -115,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uploaded_shared: streams,
                 uploaded_override: 0,
             },
+            Vec::new(),
         )
         .await?;
     session.close().await?;

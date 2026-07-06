@@ -106,7 +106,7 @@ fn is_assetstudio_worker(name: &str) -> bool {
 
 fn format_top_processes(processes: &[ProcessMemorySample], limit: usize) -> String {
     let mut sorted = processes.to_vec();
-    sorted.sort_by(|left, right| right.rss_kb.cmp(&left.rss_kb));
+    sorted.sort_by_key(|process| std::cmp::Reverse(process.rss_kb));
     sorted
         .into_iter()
         .take(limit)
