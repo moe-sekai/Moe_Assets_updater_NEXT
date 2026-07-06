@@ -166,6 +166,10 @@ impl HipSession {
         &self.inner.hello_ack
     }
 
+    pub fn max_in_flight_uploads(&self) -> usize {
+        self.inner.hello_ack.max_in_flight_uploads.max(1) as usize
+    }
+
     pub async fn check_batch(
         &self,
         items: Vec<CheckBatchItem>,

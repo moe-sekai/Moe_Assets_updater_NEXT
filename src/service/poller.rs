@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1600,6 +1601,19 @@ struct UploadOutcome {
     completed_bundles: Vec<CommitBundleCompletion>,
 }
 
+#[derive(Debug)]
+struct HipUploadFileJob {
+    bundle_path: String,
+    bundle_hash: String,
+    export_root: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+#[derive(Debug)]
+struct HipUploadFileResult {
+    placement: Option<crate::core::hip::codec::Placement>,
+}
+
 /// Upload every export product per bundle over HIP.
 /// Each upload carries the *bundle*'s fingerprint (crc32) so the gateway can
 /// group the artefacts by their source bundle version.
@@ -1611,41 +1625,52 @@ async fn upload_bundle_artefacts(
     let mut stats = CommitStats::default();
     let mut succeeded_bundles = HashSet::new();
     let mut completed_bundles = Vec::new();
+    let mut bundle_file_counts = HashMap::new();
+    let mut bundle_fingerprints = HashMap::new();
+    let mut jobs = Vec::new();
+
     for bundle in bundles {
-        let mut uploaded_or_present_files = 0usize;
+        let mut existing_files = 0usize;
+        bundle_fingerprints.insert(bundle.bundle_path.clone(), bundle.bundle_hash.clone());
         for file in &bundle.files {
             if !file.exists() || !file.is_file() {
                 continue;
             }
-            let asset_path =
-                hip_asset_path_for_file(file, &bundle.export_root, &bundle.bundle_path);
-            let ack = session
-                .upload_file(
-                    bundle.bundle_path.as_str(),
-                    asset_path.as_str(),
-                    bundle.bundle_hash.as_str(),
-                    file,
-                )
-                .await
-                .map_err(|err| PollError::Hip(err.to_string()))?;
-            match ack.placement {
-                Some(crate::core::hip::codec::Placement::Shared) => stats.uploaded_shared += 1,
-                Some(crate::core::hip::codec::Placement::Override) => stats.uploaded_override += 1,
-                None => stats.uploaded_shared += 1,
-            }
-            uploaded_or_present_files += 1;
-            debug!(
-                region = %region_name,
-                bundle = %bundle.bundle_path,
-                asset = %asset_path,
-                "hip upload OK"
-            );
+            existing_files += 1;
+            jobs.push(HipUploadFileJob {
+                bundle_path: bundle.bundle_path.clone(),
+                bundle_hash: bundle.bundle_hash.clone(),
+                export_root: bundle.export_root.clone(),
+                file: file.clone(),
+            });
         }
+        bundle_file_counts.insert(bundle.bundle_path.clone(), existing_files);
+    }
+
+    let upload_results =
+        upload_hip_files_concurrently(region_name, session, jobs, session.max_in_flight_uploads())
+            .await?;
+    for result in upload_results {
+        match result.placement {
+            Some(crate::core::hip::codec::Placement::Shared) => stats.uploaded_shared += 1,
+            Some(crate::core::hip::codec::Placement::Override) => stats.uploaded_override += 1,
+            None => stats.uploaded_shared += 1,
+        }
+    }
+
+    for bundle in bundles {
         succeeded_bundles.insert(bundle.bundle_path.clone());
         completed_bundles.push(CommitBundleCompletion {
             path: bundle.bundle_path.clone(),
-            fingerprint: bundle.bundle_hash.clone(),
-            source: if uploaded_or_present_files == 0 {
+            fingerprint: bundle_fingerprints
+                .remove(&bundle.bundle_path)
+                .unwrap_or_else(|| bundle.bundle_hash.clone()),
+            source: if bundle_file_counts
+                .get(&bundle.bundle_path)
+                .copied()
+                .unwrap_or_default()
+                == 0
+            {
                 "zero_file".to_string()
             } else {
                 "uploaded".to_string()
@@ -1657,6 +1682,70 @@ async fn upload_bundle_artefacts(
         succeeded_bundles,
         completed_bundles,
     })
+}
+
+async fn upload_hip_files_concurrently(
+    region_name: &str,
+    session: &Arc<crate::core::hip::HipSession>,
+    jobs: Vec<HipUploadFileJob>,
+    max_concurrency: usize,
+) -> Result<Vec<HipUploadFileResult>, PollError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let concurrency = max_concurrency.max(1).min(jobs.len());
+    let mut pending = jobs.into_iter();
+    let mut joins = JoinSet::new();
+    let mut results = Vec::new();
+
+    for _ in 0..concurrency {
+        if let Some(job) = pending.next() {
+            spawn_hip_upload_job(&mut joins, region_name, session, job);
+        }
+    }
+
+    while let Some(joined) = joins.join_next().await {
+        let result =
+            joined.map_err(|err| PollError::Hip(format!("hip upload task failed: {err}")))??;
+        results.push(result);
+        if let Some(job) = pending.next() {
+            spawn_hip_upload_job(&mut joins, region_name, session, job);
+        }
+    }
+
+    Ok(results)
+}
+
+fn spawn_hip_upload_job(
+    joins: &mut JoinSet<Result<HipUploadFileResult, PollError>>,
+    region_name: &str,
+    session: &Arc<crate::core::hip::HipSession>,
+    job: HipUploadFileJob,
+) {
+    let session = Arc::clone(session);
+    let region_name = region_name.to_string();
+    joins.spawn(async move {
+        let asset_path = hip_asset_path_for_file(&job.file, &job.export_root, &job.bundle_path);
+        let ack = session
+            .upload_file(
+                job.bundle_path.as_str(),
+                asset_path.as_str(),
+                job.bundle_hash.as_str(),
+                &job.file,
+            )
+            .await
+            .map_err(|err| PollError::Hip(err.to_string()))?;
+        debug!(
+            region = %region_name,
+            bundle = %job.bundle_path,
+            asset = %asset_path,
+            "hip upload OK"
+        );
+        Ok(HipUploadFileResult {
+            placement: ack.placement,
+        })
+    });
 }
 
 fn hip_asset_path_for_file(
