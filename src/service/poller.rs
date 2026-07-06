@@ -20,13 +20,16 @@ use crate::core::asset_execution::{
     CurrentVersionInfo, DownloadTask, ExecutionProgressUpdate, PreDownloadTaskFilter,
 };
 use crate::core::bundle_diff;
-use crate::core::config::AppConfig;
+use crate::core::config::{AppConfig, RegionConfig};
 use crate::core::hip::{
     CheckAction, CheckBatchItem, CommitBundleCompletion, CommitStats, HelloParams, HipClient,
 };
 use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
 use crate::core::regions::select_region;
 use crate::service::watermark::{RegionWatermark, WatermarkStore};
+
+const FAILED_REGION_RETRY_ATTEMPTS: usize = 3;
+const FAILED_REGION_RETRY_BACKOFF_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct RegionSnapshot {
@@ -296,10 +299,56 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
         }
     };
 
+    retry_region_in_place(ctx, region, &current, &request).await
+}
+
+async fn retry_region_in_place(
+    ctx: &RegionLoopCtx,
+    region: &RegionConfig,
+    current: &CurrentVersionInfo,
+    request: &AssetUpdateRequest,
+) -> Result<RunOutcome, PollError> {
+    let mut attempt = 1usize;
+    loop {
+        match execute_once_attempt(ctx, region, current, request).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(err)
+                if attempt < FAILED_REGION_RETRY_ATTEMPTS
+                    && !matches!(err, PollError::Config(_))
+                    && !ctx.cancel.is_cancelled() =>
+            {
+                let backoff = Duration::from_secs(
+                    FAILED_REGION_RETRY_BACKOFF_SECONDS.saturating_mul(attempt as u64),
+                );
+                warn!(
+                    region = %ctx.region_name,
+                    attempt,
+                    max_attempts = FAILED_REGION_RETRY_ATTEMPTS,
+                    backoff_ms = backoff.as_millis(),
+                    error = %err,
+                    "poll failed; retrying same region before releasing execution slot",
+                );
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(err),
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn execute_once_attempt(
+    ctx: &RegionLoopCtx,
+    region: &RegionConfig,
+    current: &CurrentVersionInfo,
+    request: &AssetUpdateRequest,
+) -> Result<RunOutcome, PollError> {
     // Layer 1: fetch full AssetBundleInfo, diff against the previous
     // committed snapshot. `changed` = bundles that are either new or whose
     // fingerprint has changed. Only these need to be considered further.
-    let new_info = fetch_live_asset_bundle_info(&ctx.config, &ctx.region_name, region, &request)
+    let new_info = fetch_live_asset_bundle_info(&ctx.config, &ctx.region_name, region, request)
         .await
         .map_err(|err| PollError::Execution(err.to_string()))?;
 
@@ -326,7 +375,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     // session can only COMMIT once — after COMMIT it becomes stateFinalized
     // and rejects further CHECK / UPLOAD / COMMIT).
     let check_session = if ctx.config.hip.enabled {
-        Some(connect_hip(ctx, &current, &run_id).await?)
+        Some(connect_hip(ctx, current, &run_id).await?)
     } else {
         None
     };
@@ -343,7 +392,7 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
             cancel_flag.store(true, std::sync::atomic::Ordering::Release);
         });
     }
-    let executor = AssetExecutionContext::new(&ctx.config, &ctx.region_name, region, &request)
+    let executor = AssetExecutionContext::new(&ctx.config, &ctx.region_name, region, request)
         .map_err(|err| PollError::Execution(err.to_string()))?;
 
     let changed_names: HashSet<String> =
