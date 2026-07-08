@@ -17,5 +17,5 @@ tokio = { version = "1.52", features = ["io-util", "process", "rt", "sync", "tim
 tracing = "0.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
