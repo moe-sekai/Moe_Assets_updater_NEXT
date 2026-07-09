@@ -464,7 +464,11 @@ async fn execute_once_attempt(
     // bounded artefact channel. Runs concurrently with the executor.
     let artefact_tx_for_forwarder = uploader_setup.as_ref().map(|(tx, _)| tx.clone());
     let region_name_for_progress = ctx.region_name.clone();
-    let layer1_skipped_for_progress = layer1_skipped_before_check;
+    let layer1_skipped_for_progress = if ctx.config.hip.enabled {
+        0
+    } else {
+        layer1_skipped_before_check
+    };
     let check_skipped_for_progress = check_skipped_counter.clone();
     let forwarder = tokio::spawn(async move {
         let mut reporter = ProgressReporter::new(
@@ -1346,6 +1350,18 @@ impl PreDownloadTaskFilter for CombinedFilter {
         >,
     > {
         Box::pin(async move {
+            // When HIP is enabled, the gateway is the source of truth. Layer-1
+            // only says "this bundle did not change compared with the local
+            // snapshot"; it does not prove the gateway has a durable
+            // completion row. Ask HIP about every planned task so a stale or
+            // partial local snapshot cannot hide missing gateway bundles until
+            // the container is restarted.
+            if let Some(hip) = self.hip {
+                self.layer1_skipped
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                return hip.filter(tasks).await;
+            }
+
             // Layer 1: keep only tasks whose bundle_path is in the diff set.
             let mut kept = Vec::with_capacity(tasks.len());
             let mut skipped_by_layer1 = 0u64;
@@ -1359,12 +1375,7 @@ impl PreDownloadTaskFilter for CombinedFilter {
             self.layer1_skipped
                 .store(skipped_by_layer1, std::sync::atomic::Ordering::Relaxed);
 
-            // Layer 2: hand off to HIP check_batch if configured.
-            if let Some(hip) = self.hip {
-                hip.filter(kept).await
-            } else {
-                Ok(kept)
-            }
+            Ok(kept)
         })
     }
 }
