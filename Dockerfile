@@ -35,7 +35,7 @@ RUN cargo build --release --locked \
     -p haruki-assetstudio-ffi \
     --features haruki-sekai-asset-updater/media-ffi
 
-FROM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS assetstudio-builder
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS assetstudio-builder
 ARG TARGETARCH
 WORKDIR /src
 ARG ASSETSTUDIO_REPOSITORY=https://github.com/Team-Haruki/AssetStudio.git
@@ -56,8 +56,8 @@ RUN cd AssetStudio/AssetStudioFFI && \
         arm64) runtime_id=linux-arm64 ;; \
         *) echo "Unsupported Docker target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    dotnet publish -c Release -r "${runtime_id}" -f net9.0 --self-contained true -o /app/assetstudio-ffi \
-    -p:TargetFrameworks=net9.0 \
+    dotnet publish -c Release -r "${runtime_id}" -f net10.0 --self-contained true -o /app/assetstudio-ffi \
+    -p:TargetFrameworks=net10.0 \
     -p:PublishAot=true \
     -p:InvariantGlobalization=true
 
