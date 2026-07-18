@@ -80,7 +80,7 @@ where
     let first_error = Arc::new(Mutex::new(None::<ExportPipelineError>));
     let task = Arc::new(task);
     let mut handles = Vec::with_capacity(worker_count);
-    const WORKER_STACK_SIZE: usize = 4 * 1024 * 1024;
+    const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
     for _ in 0..worker_count {
         let queue = queue.clone();
